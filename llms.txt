@@ -26,6 +26,9 @@ Leading the technical architecture and delivery of Agentic AI workflows and secu
 - Live full-stack SaaS built with React and Firebase
 - Automated AI pipeline that synthesises lecture audio into study notes
 
+### Founder & Principal Engineer – Atvora (2026 – Present)
+Atvora (https://atvora.com) is a software studio in Christchurch, New Zealand that builds production grade, white label web applications for agencies, shipped in days with a written Evidence Pack documenting how every build was tested and verified.
+
 ## Previous Experience
 
 ### Process Automation Lead – IJG Trails (Dec 2021 – May 2023)
