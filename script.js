@@ -59,35 +59,25 @@ setTimeout(typeStatus, 500);
 
 // --- 3. GHOST CODER (Top Left - Always Loop) ---
 const ghostSnippet = `
-import { Vapi } from 'vapi-sdk';
+import { McpServer } from '@modelcontextprotocol/sdk';
 import { createClient } from '@supabase/supabase-js';
 
-// --- SYSTEM: STUDYPOINTS.NET ---
-// Automated Lecture Synthesis Pipeline
+// --- SYSTEM: AGENTIC WORKFLOW ---
+// Secure MCP tool server with field redaction
 
 const supabase = createClient(env.DB_URL, env.DB_KEY);
+const server = new McpServer({ name: "payroll-tools" });
 
-async function processAudioStream(streamId) {
-    console.log("[INIT] Connecting Vapi Agent...");
-    
-    // 1. Ingest Audio
-    const session = await Vapi.connect({
-        transcriber: "deepgram-nova-2",
-        model: "gpt-5"
-    });
+server.tool("get_employee", async ({ id }) => {
+    const { data } = await supabase
+        .from('staff').select('*').eq('id', id);
 
-    // 2. Real-time Analysis
-    session.on('message', async (msg) => {
-        if (msg.type === 'transcript') {
-            await supabase.from('notes').insert({
-                content: msg.text,
-                timestamp: new Date()
-            });
-        }
-    });
+    // Redact sensitive fields before the model sees them
+    return redact(data, ['bank', 'ird', 'salary']);
+});
 
-    return "PIPELINE_ACTIVE";
-}
+await server.connect();
+console.log("[INIT] MCP server online. Tools exposed.");
 `;
 const ghostWindow = document.getElementById('ghost-code-window');
 let ghostIdx = 0;
@@ -218,21 +208,26 @@ function switchTab(tab) {
     }
 }
 
+let alexAgentBusy = false;
+
 function askQuestion(type) {
+    if (alexAgentBusy) return; // ignore clicks while a response is streaming
     const history = document.getElementById('chat-history');
     let question = "";
     let answer = "";
 
     if (type === 'who') {
         question = "Who is Alexander?";
-        answer = "Alexander is an AI Engineer and Systems Architect who bridges technical execution with business strategy. He has been automating professionally since 2022 and currently serves as a contract AI Engineer for Harkness AI and a Technical Member of the AI Forum NZ.";
+        answer = "Alexander is an AI Engineer and Agentic Systems Architect who bridges technical execution with business strategy. He has been automating professionally since late 2021 and currently serves as a contract AI Engineer for Harkness AI and a contributor to the AI Forum NZ LLM Working Group.";
     } else if (type === 'stack') {
         question = "What is his tech stack?";
-        answer = "He leverages a multi-model intelligence layer using OpenAI, Claude, and Gemini. His infrastructure is architected around Vertex AI, Vapi, and Supabase, orchestrated through Next.js and Python for scalable production systems.";
+        answer = "He leverages a multi-model intelligence layer using OpenAI, Claude, and Gemini. He specialises in Model Context Protocol (MCP) servers, RAG pipelines, and secure Supabase backends, orchestrated through Next.js, TypeScript, and Python for scalable production systems.";
     } else if (type === 'contact') {
         question = "How do I contact him?";
         answer = "You can email him at me@alexrussell.io or run the Contact Protocol on the right!";
     }
+
+    alexAgentBusy = true;
 
     // Append Question
     const qEl = document.createElement('div');
@@ -247,15 +242,31 @@ function askQuestion(type) {
     history.appendChild(loaderEl);
     history.scrollTop = history.scrollHeight;
 
-    // Replace loader with answer after 2 seconds
+    // After a brief think, stream the answer character by character (typewriter effect)
     setTimeout(() => {
         loaderEl.remove();
         const aEl = document.createElement('div');
         aEl.className = "mb-4";
-        aEl.innerHTML = `<span class="text-green-500">ALEX_AGENT ></span> ${answer}`;
+        aEl.innerHTML = `<span class="text-green-500">ALEX_AGENT ></span> <span class="agent-answer"></span><span class="terminal-cursor"></span>`;
         history.appendChild(aEl);
-        history.scrollTop = history.scrollHeight;
-    }, 2000);
+
+        const answerSpan = aEl.querySelector('.agent-answer');
+        const cursor = aEl.querySelector('.terminal-cursor');
+        let i = 0;
+
+        const typeChar = () => {
+            if (i < answer.length) {
+                answerSpan.textContent += answer.charAt(i);
+                i++;
+                history.scrollTop = history.scrollHeight;
+                setTimeout(typeChar, 16);
+            } else {
+                if (cursor) cursor.remove();
+                alexAgentBusy = false;
+            }
+        };
+        typeChar();
+    }, 800);
 
     history.scrollTop = history.scrollHeight;
 }
