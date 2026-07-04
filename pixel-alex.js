@@ -10,7 +10,10 @@
  *
  * He is aware of the visitor: his eyes follow the cursor, he turns to
  * face it when it comes near, steps aside if it gets too close, and
- * waves back at a cursor that lingers. He watches the page too — he
+ * waves back at a cursor that lingers. When the visitor hovers one of
+ * the page's highlighted boxes he treats it as the current exhibit —
+ * he runs (or de-rezzes) over, presents it, then sits on it keeping
+ * the visitor company while they read. He watches the page too — he
  * inspects the terminal panel, cheers when the contact protocol runs,
  * wanders and hops between nearby ledges while idling, and sits on
  * edges when left alone.
@@ -22,13 +25,16 @@
  * de-rezzes straight to where the visitor is. The aim: he should
  * never be off screen for more than a beat.
  *
+ * Pixel mode is an easter egg: clicking Alexander's name in the header
+ * (or the portrait on desktop) toggles it, and the choice persists in
+ * localStorage. There is no visible control.
+ *
  * Everything is self contained: sprites are hand-authored pixel maps
  * baked once to offscreen canvases, physics is a rAF loop on one small
  * transformed canvas (render-throttled while deeply idle). No
  * libraries, no layout impact (position:absolute + pointer-events:
  * none), aria-hidden, and it never initialises under
- * prefers-reduced-motion or below 420px width (intentional: no phone
- * mode).
+ * prefers-reduced-motion.
  *
  * Debug: append ?alexdebug to the URL to see the sprite sheet, the
  * platform map, and window.__alex().
@@ -37,7 +43,6 @@
   "use strict";
 
   if (matchMedia("(prefers-reduced-motion: reduce)").matches) return;
-  if (innerWidth < 420) return; // too narrow for parkour to read well
 
   /* ------------------------------------------------------------------ *
    * 1. SPRITES
@@ -45,8 +50,8 @@
 
   var PAL = {
     k: "#0c1016", // outline
-    h: "#8a6a45", // hair
-    H: "#a8845c", // hair highlight
+    h: "#c9a052", // hair (golden blonde)
+    H: "#e8ca7e", // hair highlight
     s: "#eab894", // skin
     S: "#cf9873", // skin shadow
     e: "#20304a", // eyes
@@ -603,7 +608,6 @@
   var MODE_KEY = "pixel-alex-mode";
   var canvasMounted = false;
   var enabled = false;
-  var toggleButton = null;
 
   var DEBUG = /[?&]alexdebug/.test(location.search);
   var debugLayer = null;
@@ -701,7 +705,95 @@
   var TEXT_SELECTOR =
     "p, li, h1, h2, h3, h4, dd, blockquote, figcaption, a, button, .project-bubble-desc";
 
+  // the boxes that light up on hover; when the visitor highlights one,
+  // Alex treats it as the current exhibit and goes to attend it
+  var BOX_SELECTOR =
+    ".animated-border-box, .glass-panel, .skill-category, .timeline-content, " +
+    ".project-bubble, .cert-card, .job-block, #ghost-code-window";
+
   var platforms = [];
+
+  var hover = { el: null, at: -1e9, presented: false };
+
+  addEventListener(
+    "pointerover",
+    function (e) {
+      var t = e.target;
+      var el = t && t.closest ? t.closest(BOX_SELECTOR) : null;
+      if (el && el.closest("#sticky-nav")) el = null;
+      if (el !== hover.el) {
+        hover.el = el;
+        hover.at = performance.now();
+        hover.presented = false;
+      }
+    },
+    { passive: true }
+  );
+
+  function hoverFor() {
+    return (performance.now() - hover.at) / 1000;
+  }
+
+  function platformByEl(el) {
+    for (var i = 0; i < platforms.length; i++) {
+      if (platforms[i].el === el) return platforms[i];
+    }
+    return null;
+  }
+
+  // the platform behind the hovered box: the box itself, the nearest
+  // boxy ancestor, or failing that the highest ledge inside the box
+  // (its title heading, an inner card). Boxes that have left the
+  // viewport (stale hover after a scroll) do not count.
+  function hoverPlatform() {
+    var el = hover.el;
+    if (!el) return null;
+    var p = null;
+    var probe = el;
+    while (probe && !p) {
+      p = platformByEl(probe);
+      if (!p) probe = probe.parentElement ? probe.parentElement.closest(BOX_SELECTOR) : null;
+    }
+    if (!p) {
+      var bestY = Infinity;
+      for (var i = 0; i < platforms.length; i++) {
+        var q = platforms[i];
+        if (q.y < bestY && el.contains(q.el)) {
+          bestY = q.y;
+          p = q;
+        }
+      }
+    }
+    if (!p && el.getBoundingClientRect) {
+      // nothing standable on the box at all (its top is covered by
+      // text): attend from the nearest ledge so he still reacts
+      var r = el.getBoundingClientRect();
+      var bx = r.left + scrollX + r.width / 2;
+      var by = r.top + scrollY;
+      var bestD = Infinity;
+      for (var j = 0; j < platforms.length; j++) {
+        var c = platforms[j];
+        var cx = Math.max(c.x1, Math.min(c.x2, bx));
+        var d = Math.hypot(cx - bx, c.y - by);
+        if (d < 340 && d < bestD) {
+          bestD = d;
+          p = c;
+        }
+      }
+    }
+    if (!p) return null;
+    if (p.y < scrollY - 60 || p.y > scrollY + innerHeight + 100) return null;
+    return p;
+  }
+
+  // is he genuinely standing on the hovered box (or a ledge inside it /
+  // its boxy ancestor), as opposed to attending from a nearby proxy?
+  function hoverIsGenuine(p) {
+    return (
+      !!hover.el &&
+      (p.el === hover.el || hover.el.contains(p.el) || p.el.contains(hover.el))
+    );
+  }
 
   function kindOf(el) {
     if (el.id === "ghost-code-window") return "code";
@@ -766,12 +858,21 @@
     }
     var textRects = [];
     var textEls = document.querySelectorAll(TEXT_SELECTOR);
+    var glyphRange = document.createRange();
     for (var t = 0; t < textEls.length; t++) {
       var tel = textEls[t];
       if (tel.closest("#sticky-nav")) continue;
       if (!tel.textContent || !tel.textContent.trim()) continue;
       var tr = tel.getBoundingClientRect();
       if (tr.width <= 0 || tr.height <= 0) continue;
+      // block elements report the full row width even for short text;
+      // measure the actual glyphs so a short heading does not wipe out
+      // the entire ledge beneath it
+      try {
+        glyphRange.selectNodeContents(tel);
+        var gr = glyphRange.getBoundingClientRect();
+        if (gr.width > 0 && gr.height > 0) tr = gr;
+      } catch (err) {}
       textRects.push({
         x1: tr.left + scrollX,
         x2: tr.right + scrollX,
@@ -1180,22 +1281,96 @@
     return Math.hypot(cursorDocX() - hx, cursorDocY() - hy);
   }
 
+  // nearest end of the ledge interval he is standing in — a spot where
+  // the sit frame's dangling legs read correctly
+  function nearestLedgeEdgeX() {
+    var p = alex.platform;
+    if (!p) return alex.x;
+    if (!p.iv || !p.iv.length) {
+      return alex.x - p.x1 < p.x2 - alex.x ? p.x1 + 4 : p.x2 - 4;
+    }
+    for (var i = 0; i < p.iv.length; i++) {
+      var iv = p.iv[i];
+      if (alex.x >= iv[0] - 2 && alex.x <= iv[1] + 2) {
+        return alex.x - iv[0] < iv[1] - alex.x ? iv[0] + 2 : iv[1] - 2;
+      }
+    }
+    return alex.x;
+  }
+
   function think(dt) {
     var band = comfortBand();
     alex.idleFor += dt;
+
+    // --- attend the box the visitor is highlighting ----------------------
+    // He notices the hover, comes over (de-rezzing if it is out of range),
+    // presents the box once, then settles on its edge for as long as the
+    // visitor stays. The early returns suppress wandering and guide mode
+    // so he stays attentive.
+    var hovered = hoverPlatform();
+    if (hovered) {
+      if (alex.platform === hovered) {
+        alex.hurry = false;
+        if (alex.state === "idle") {
+          if (cursorRecent(6000)) alex.dir = cursorDocX() >= alex.x ? 1 : -1;
+          if (!hover.presented && hoverFor() > 0.35) {
+            hover.presented = true;
+            // only present when actually on the box; from a nearby proxy
+            // ledge the underline would highlight the wrong element
+            if (hoverIsGenuine(hovered)) setState("present");
+          } else if (hover.presented && hoverFor() > 4.5 && clock > alex.sitUntil) {
+            var edge = nearestLedgeEdgeX();
+            if (Math.abs(edge - alex.x) < 14) {
+              alex.sitUntil = clock + 2;
+              setState("sit");
+            } else {
+              alex.target = null;
+              alex.targetX = edge;
+              alex.pace = 140;
+              setState("run");
+            }
+          }
+        }
+        return;
+      }
+      if (alex.state === "run" && alex.target === hovered) return; // on his way
+      if (hoverFor() > 0.35 && (alex.state === "idle" || alex.state === "run")) {
+        moveToward(hovered);
+        return;
+      }
+    }
 
     var offTop = alex.y < band.top - 20; // visitor scrolled down past him
     var offBot = alex.y > band.bot + 20; // visitor scrolled up past him
 
     if (offTop || offBot) {
-      moveToward(pickTarget(offTop ? 1 : -1));
-      return;
+      var rescue = pickTarget(offTop ? 1 : -1);
+      var gain = rescue
+        ? Math.abs(alex.y - band.mid) - Math.abs(rescue.y - band.mid)
+        : 0;
+      // only travel if it actually gets him closer to the comfort band
+      // (or he is invisible, where any move beats none). A tall section
+      // with no standable ledge inside the band used to ping-pong him
+      // between the headings above and below it forever.
+      if (rescue && rescue !== alex.platform && (gain > 40 || offScreenBy() !== 0)) {
+        moveToward(rescue);
+        return;
+      }
     }
     alex.hurry = false;
 
     // --- guide mode: point out the strongest content when all is calm ---
     var anchor = settled() ? bestAnchor() : null;
-    if (alex.state === "idle" && anchor && anchor !== alex.platform && alex.idleFor > 1.2) {
+    if (
+      alex.state === "idle" &&
+      anchor &&
+      anchor !== alex.platform &&
+      alex.idleFor > 1.2 &&
+      // an anchor outside the comfort band is a trap: the band logic
+      // would immediately pull him back, and he would oscillate forever
+      anchor.y > band.top - 20 &&
+      anchor.y < band.bot + 20
+    ) {
       if (reachable(anchor)) {
         alex.target = anchor;
         alex.targetX = spotOn(anchor, alex.x);
@@ -1400,13 +1575,24 @@
         }
         break;
 
-      case "sit":
+      case "sit": {
+        var sitHover = hoverPlatform();
+        if (sitHover === alex.platform && sitHover) {
+          // the visitor is still on this box: keep him company
+          alex.sitUntil = Math.max(alex.sitUntil, clock + 1.2);
+        } else if (sitHover) {
+          // they moved to another box: get up and let think() route him
+          alex.idleFor = 0;
+          setState("idle");
+          break;
+        }
         if (clock > alex.sitUntil) {
           alex.idleFor = 0;
           alex.nextWanderAt = 1;
           setState("idle");
         }
         break;
+      }
 
       case "inspect":
         // crouch over the panel and poke at it; green bits fly
@@ -1743,7 +1929,10 @@
 
     // smoothed scroll velocity feeds the projected comfort band
     var inst = (scrollY - lastScrollY) / dt;
-    if (scrollY !== lastScrollY) lastScrollAt = performance.now();
+    if (scrollY !== lastScrollY) {
+      lastScrollAt = performance.now();
+      hover.el = null; // pointerover does not refire on scroll: hover is stale
+    }
     lastScrollY = scrollY;
     scrollVel = scrollVel * 0.8 + inst * 0.2;
 
@@ -1816,46 +2005,25 @@
     } catch (e) {}
   }
 
-  function updateToggleButton() {
-    if (!toggleButton) return;
-    toggleButton.textContent = enabled ? "■ PIXEL MODE" : "► PIXEL MODE";
-    toggleButton.setAttribute("aria-pressed", enabled ? "true" : "false");
-  }
-
-  function installToggle() {
-    if (toggleButton) return;
-    var mail = document.querySelector('#main-header a[href^="mailto"]');
-    var row = mail && mail.parentElement;
-    toggleButton = document.createElement("button");
-    toggleButton.type = "button";
-    toggleButton.style.cssText =
-      "font-family:inherit;font-size:11px;letter-spacing:0.15em;text-transform:uppercase;padding:8px 14px;background:transparent;color:#22c55e;border:1px solid rgba(34,197,94,0.6);border-radius:2px;cursor:pointer;";
-    if (row) {
-      row.appendChild(toggleButton);
-    } else {
-      toggleButton.style.position = "fixed";
-      toggleButton.style.top = "76px";
-      toggleButton.style.right = "18px";
-      toggleButton.style.zIndex = "49";
-      document.body.appendChild(toggleButton);
-    }
-    toggleButton.onmouseenter = function () {
-      toggleButton.style.background = "rgba(34,197,94,0.15)";
-    };
-    toggleButton.onmouseleave = function () {
-      toggleButton.style.background = "transparent";
-    };
-    toggleButton.addEventListener("click", function () {
-      var on = !enabled;
-      storeMode(on);
-      if (on) {
-        enable();
-      } else {
-        disable();
-      }
-      updateToggleButton();
+  // the easter egg: clicking Alexander's name in the header (works on
+  // touch too) or the portrait (desktop only) toggles pixel mode
+  function installEasterEgg() {
+    var triggers = [];
+    var name = document.querySelector("#main-header h1");
+    if (name) triggers.push(name);
+    var portrait = document.querySelector('#main-header img[alt="Alexander Russell"]');
+    if (portrait) triggers.push(portrait.closest(".group") || portrait);
+    triggers.forEach(function (el) {
+      el.addEventListener("click", function () {
+        var on = !enabled;
+        storeMode(on);
+        if (on) {
+          enable();
+        } else {
+          disable();
+        }
+      });
     });
-    updateToggleButton();
   }
 
   function enable() {
@@ -1865,7 +2033,6 @@
     running = true;
     resizeObserver.observe(document.body);
     start();
-    updateToggleButton();
   }
 
   function disable() {
@@ -1880,7 +2047,6 @@
     canvas.style.opacity = "0";
     hideGuideUnderline();
     resizeObserver.disconnect();
-    updateToggleButton();
   }
 
   window.addEventListener("resize", scheduleRebuild);
@@ -1897,12 +2063,8 @@
   });
 
   function boot() {
-    installToggle();
-    if (storedModeOn()) {
-      enable();
-    } else {
-      disable();
-    }
+    installEasterEgg();
+    if (storedModeOn()) enable();
   }
 
   if (document.readyState === "complete" || document.readyState === "interactive") {
