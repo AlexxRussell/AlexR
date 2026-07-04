@@ -54,10 +54,10 @@
     H: "#e8ca7e", // hair highlight
     s: "#eab894", // skin
     S: "#cf9873", // skin shadow
-    e: "#20304a", // eyes
+    e: "#1e40af", // eyes (dark blue)
     g: "#1d3242", // hoodie
     G: "#152633", // hoodie shade / sleeves
-    z: "#00e05a", // zip + accents (terminal green)
+    z: "#e63946", // zip + shirt accent (red)
     d: "#2f4166", // denim
     D: "#243350", // denim shade
     w: "#e8edf3", // shoe
@@ -668,7 +668,7 @@
           vx: Math.random() * 50 - 25,
           vy: -40 - Math.random() * 70,
           t: 0,
-          c: PAL.z,
+          c: "#00e05a", // digital dust stays terminal green
         });
       }
     },
@@ -1603,7 +1603,7 @@
             vx: alex.dir * (10 + Math.random() * 30),
             vy: -30 - Math.random() * 50,
             t: 0,
-            c: PAL.z,
+            c: "#00e05a", // digital dust stays terminal green
           });
         }
         if (alex.stateT > 1.5) {
