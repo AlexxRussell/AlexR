@@ -224,13 +224,6 @@ h2::before { content: "> "; color: var(--terminal-green); }
     50%, 100% { color: #00ff00; } /* Green */
 }
 
-/* Eleven Labs AI Voice Widget */
-elevenlabs-convai {
-    z-index: 9999 !important;
-    --font-family: 'JetBrains Mono', 'Courier New', monospace !important;
-    font-family: 'JetBrains Mono', 'Courier New', monospace !important;
-}
-
 /* Animated Border Box (Similar to Kevin's Resume) */
 .animated-border-box {
     position: relative;
