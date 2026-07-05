@@ -210,25 +210,26 @@ const WIDGET_CSS = `
         padding: 10px 16px 10px 12px;
         border: 1px solid #0a0a0a;
         border-radius: 9999px;
-        background: #f5f6f7;
-        color: #0a0a0a;
+        background: rgba(6, 12, 20, 0.85);
+        color: #00ff41;
         font-size: 12px;
         font-weight: 700;
         letter-spacing: 0.14em;
-        box-shadow: 0 4px 16px rgba(0, 0, 0, 0.45);
+        box-shadow: 0 6px 20px rgba(0, 0, 0, 0.6);
         backdrop-filter: blur(6px);
         -webkit-backdrop-filter: blur(6px);
         transition: transform 0.25s ease, box-shadow 0.25s ease;
     }
     .launcher:hover {
         transform: translateY(-2px);
-        box-shadow: 0 8px 24px rgba(0, 0, 0, 0.55);
+        box-shadow: 0 8px 24px rgba(0, 0, 0, 0.7);
     }
     .launcher[hidden] { display: none; }
     .launcher .mini { width: 24px; height: 24px; display: block; }
     .launcher .dot {
         width: 7px; height: 7px; border-radius: 50%;
-        background: #0a0a0a;
+        background: #00ff41;
+        box-shadow: 0 0 8px #00ff41;
         animation: avw-pulse 2s infinite;
     }
 
@@ -2209,7 +2210,7 @@ class AlexVoiceWidget extends HTMLElement {
         const n = 4, barW = 3, gap = 2;
         const total = n * barW + (n - 1) * gap;
         const x0 = (24 - total) / 2;
-        c.fillStyle = 'rgba(10,10,10,0.92)';
+        c.fillStyle = 'rgba(0,255,65,0.9)';
         for (let i = 0; i < n; i++) {
             const breath = REDUCED.matches ? 0.5 : 0.5 + 0.5 * Math.sin(ts / 700 + i * 0.9);
             const h = 5 + 9 * breath * (i === 1 || i === 2 ? 1 : 0.65);
