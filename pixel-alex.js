@@ -5,18 +5,26 @@
  * elements (headings, panels, cards, the footer), and when the visitor
  * scrolls he parkours to stay in view: running along ledges, leaping
  * gaps, dropping with a tucked jump, mantling up over headings when the
- * visitor scrolls back up. If a move is out of range he de-rezzes and
- * blips back in like a proper video game character.
+ * visitor scrolls back up. Where overhead text leaves no room to stand
+ * he ducks and shuffles through at a crouch, and when the way down is
+ * straight through the page's structure he hops down through it — card
+ * top to inner bubble to the next card — instead of de-rezzing. If a
+ * move is truly out of range he de-rezzes and blips back in like a
+ * proper video game character.
  *
  * He is aware of the visitor: his eyes follow the cursor, he turns to
  * face it when it comes near, steps aside if it gets too close, and
  * waves back at a cursor that lingers. When the visitor hovers one of
  * the page's highlighted boxes he treats it as the current exhibit —
  * he runs (or de-rezzes) over, presents it, then sits on it keeping
- * the visitor company while they read. He watches the page too — he
- * inspects the terminal panel, cheers when the contact protocol runs,
- * wanders and hops between nearby ledges while idling, and sits on
- * edges when left alone.
+ * the visitor company while they read. On touch screens taps stand in
+ * for the cursor, tapping a box sends him over to attend it, and once
+ * a scroll settles he attends the box nearest the centre of the
+ * screen. He watches the page too — he inspects the terminal panel,
+ * cheers when the contact protocol runs (or a voice call connects),
+ * wanders and hops between nearby ledges while idling, sits on edges
+ * when left alone, and settles down to wait when the visitor goes
+ * quiet or the tab is hidden.
  *
  * Follow logic is scroll-velocity aware: the comfort band is computed
  * against a projected scroll position, soft states (wave, sit, land)
@@ -25,24 +33,23 @@
  * de-rezzes straight to where the visitor is. The aim: he should
  * never be off screen for more than a beat.
  *
- * Pixel mode is an easter egg: clicking Alexander's name in the header
- * (or the portrait on desktop) toggles it, and the choice persists in
- * localStorage. There is no visible control.
+ * Pixel mode is an easter egg: clicking or tapping Alexander's name in
+ * the header (or the portrait on desktop) toggles it, and the choice
+ * persists in localStorage. There is no visible control.
  *
  * Everything is self contained: sprites are hand-authored pixel maps
  * baked once to offscreen canvases, physics is a rAF loop on one small
  * transformed canvas (render-throttled while deeply idle). No
  * libraries, no layout impact (position:absolute + pointer-events:
- * none), aria-hidden, and it never initialises under
- * prefers-reduced-motion.
+ * none), aria-hidden. Under prefers-reduced-motion he never
+ * auto-starts, but the name tap still toggles him on — an explicit
+ * tap is an informed opt-in.
  *
  * Debug: append ?alexdebug to the URL to see the sprite sheet, the
- * platform map, and window.__alex().
+ * platform map (duck zones in orange), and window.__alex().
  */
 (function () {
   "use strict";
-
-  if (matchMedia("(prefers-reduced-motion: reduce)").matches) return;
 
   /* ------------------------------------------------------------------ *
    * 1. SPRITES
@@ -292,6 +299,66 @@
       "......kddkkddk......",
       "......kwwkkwwk......",
       "......kWWkkWWk......",
+      "....................",
+    ],
+    // crouched under a low ceiling: knees bent, torso lowered, head
+    // tucked — the visible body is ~17 rows so he clears overhangs the
+    // full 26-row stance cannot. duckA/duckB alternate as a subtle bob
+    // while idle and as a shuffle while moving.
+    duckA: [
+      "....................",
+      "....................",
+      "....................",
+      "....................",
+      "....................",
+      "....................",
+      "....................",
+      "....................",
+      "......kkkkkkkk......",
+      ".....khhHHHHhhk.....",
+      ".....khHhhhhhhk.....",
+      ".....khhhhhhhhk.....",
+      ".....khsssssshk.....",
+      ".....kssessessk.....",
+      ".....kSssssssSk.....",
+      "......kssssssk......",
+      "......kggggggk......",
+      ".....kGggzzggGk.....",
+      ".....kGggzzggGk.....",
+      ".....ksGGzzGGsk.....",
+      "......kGGGGGGk......",
+      ".....kddk..kddk.....",
+      ".....kDdk..kdDk.....",
+      ".....kwwk..kwwk.....",
+      ".....kWWk..kWWk.....",
+      "....................",
+    ],
+    duckB: [
+      "....................",
+      "....................",
+      "....................",
+      "....................",
+      "....................",
+      "....................",
+      "....................",
+      "....................",
+      "....................",
+      "......kkkkkkkk......",
+      ".....khhHHHHhhk.....",
+      ".....khHhhhhhhk.....",
+      ".....khhhhhhhhk.....",
+      ".....khsssssshk.....",
+      ".....kssessessk.....",
+      ".....kSssssssSk.....",
+      "......kssssssk......",
+      "......kggggggk......",
+      ".....kGggzzggGk.....",
+      ".....ksGGzzGGsk.....",
+      "......kGGGGGGk......",
+      ".....kddk..kddk.....",
+      ".....kDdk..kdDk.....",
+      ".....kwwk..kwwk.....",
+      ".....kWWk..kWWk.....",
       "....................",
     ],
     // ---- side view, facing right (left is mirrored at build time) -----
@@ -581,7 +648,7 @@
   // eye row per front-facing frame (eyes sit at x=8 and x=11 in both
   // the right and mirrored bake, the faces being symmetric); used by
   // the cursor-gaze overlay in render()
-  var EYE_ROW = { idleA: 6, idleB: 7, waveA: 6, waveB: 6, pointA: 6, pointB: 6, sit: 10 };
+  var EYE_ROW = { idleA: 6, idleB: 7, waveA: 6, waveB: 6, pointA: 6, pointB: 6, sit: 10, duckA: 13, duckB: 14 };
 
   /* ------------------------------------------------------------------ *
    * 2. STAGE
@@ -605,6 +672,20 @@
   var ctx = canvas.getContext("2d");
   ctx.imageSmoothingEnabled = false;
 
+  // SCALE (and everything derived from it: CW/CH, the carve band, the
+  // canvas CSS size) is viewport-dependent; recomputed on every rebuild
+  // so rotation and resizes keep the sprite and its geometry consistent.
+  // The frames themselves never re-bake — the CSS size scales them.
+  function applyScale() {
+    var s = innerWidth < 640 ? 2 : 3;
+    if (s === SCALE) return;
+    SCALE = s;
+    CW = SW * SCALE;
+    CH = SH * SCALE;
+    canvas.style.width = CW + "px";
+    canvas.style.height = CH + "px";
+  }
+
   var MODE_KEY = "pixel-alex-mode";
   var canvasMounted = false;
   var enabled = false;
@@ -624,6 +705,18 @@
 
   addEventListener(
     "pointermove",
+    function (e) {
+      cursor.cx = e.clientX;
+      cursor.cy = e.clientY;
+      cursor.movedAt = performance.now();
+    },
+    { passive: true }
+  );
+
+  // touch has no hover and rarely a pointermove: taps seed the cursor
+  // so gaze, waves and step-asides can happen around them too
+  addEventListener(
+    "pointerdown",
     function (e) {
       cursor.cx = e.clientX;
       cursor.cy = e.clientY;
@@ -713,7 +806,9 @@
 
   var platforms = [];
 
-  var hover = { el: null, at: -1e9, presented: false };
+  // touchPick marks attention chosen by the centred-box picker (below),
+  // which explicit input — a hover or a tap — is always allowed to beat
+  var hover = { el: null, at: -1e9, presented: false, touchPick: false };
 
   addEventListener(
     "pointerover",
@@ -725,10 +820,82 @@
         hover.el = el;
         hover.at = performance.now();
         hover.presented = false;
+        hover.touchPick = false;
       }
     },
     { passive: true }
   );
+
+  // ---- touch-era attention ------------------------------------------
+  // pointerover is dead on touch screens, so two analogues stand in:
+  // tapping a box is the strong version of pointing at it, and once a
+  // scroll settles the box nearest the viewport centre (and mostly
+  // visible) becomes the attended one. Desktop-with-mouse never uses
+  // either — the pointerover flow above is unchanged there.
+
+  var hoverNoneMQ = matchMedia("(hover: none)");
+
+  function touchMode() {
+    return hoverNoneMQ.matches;
+  }
+
+  addEventListener(
+    "pointerdown",
+    function (e) {
+      if (!touchMode()) return;
+      var t = e.target;
+      var el = t && t.closest ? t.closest(BOX_SELECTOR) : null;
+      if (el && el.closest("#sticky-nav")) el = null;
+      if (el && el !== hover.el) {
+        hover.el = el;
+        hover.at = performance.now();
+        hover.presented = false;
+        hover.touchPick = false;
+      }
+    },
+    { passive: true }
+  );
+
+  var attendPickAt = 0;
+
+  function pickCenteredBox() {
+    var hc = innerWidth / 2;
+    var vc = innerHeight / 2;
+    var els = document.querySelectorAll(BOX_SELECTOR);
+    var best = null,
+      bestD = Infinity;
+    for (var i = 0; i < els.length; i++) {
+      var el = els[i];
+      if (el.closest("#sticky-nav")) continue;
+      var r = el.getBoundingClientRect();
+      if (r.width < 60 || r.height < 20) continue;
+      var visW = Math.min(r.right, innerWidth) - Math.max(r.left, 0);
+      var visH = Math.min(r.bottom, innerHeight) - Math.max(r.top, 0);
+      if (visW <= 0 || visH <= 0) continue;
+      if ((visW * visH) / (r.width * r.height) < 0.4) continue; // mostly visible only
+      var d = Math.hypot(r.left + r.width / 2 - hc, r.top + r.height / 2 - vc);
+      if (d < bestD) {
+        bestD = d;
+        best = el;
+      }
+    }
+    return best;
+  }
+
+  function touchAttend(now) {
+    if (!touchMode()) return;
+    if (now - lastScrollAt < ATTEND_SETTLE_MS) return; // wait for the scroll to settle
+    if (hover.el && !hover.touchPick) return; // a real hover/tap owns attention
+    if (now - attendPickAt < 400) return; // don't thrash the DOM
+    attendPickAt = now;
+    var el = pickCenteredBox();
+    if (el && el !== hover.el) {
+      hover.el = el;
+      hover.at = now;
+      hover.presented = false;
+      hover.touchPick = true;
+    }
+  }
 
   function hoverFor() {
     return (performance.now() - hover.at) / 1000;
@@ -831,6 +998,30 @@
     return next;
   }
 
+  function mergeIntervals(intervals) {
+    if (intervals.length < 2) return intervals;
+    intervals.sort(function (a, b) {
+      return a[0] - b[0];
+    });
+    var out = [intervals[0]];
+    for (var i = 1; i < intervals.length; i++) {
+      var iv = intervals[i];
+      var lastIv = out[out.length - 1];
+      if (iv[0] <= lastIv[1]) lastIv[1] = Math.max(lastIv[1], iv[1]);
+      else out.push(iv);
+    }
+    return out;
+  }
+
+  // is x under a low ceiling on platform p (standing blocked, crouch ok)?
+  function duckAt(p, x) {
+    if (!p || !p.duck || !p.duck.length) return false;
+    for (var i = 0; i < p.duck.length; i++) {
+      if (x >= p.duck[i][0] && x <= p.duck[i][1]) return true;
+    }
+    return false;
+  }
+
   function inIntervals(p, x, pad) {
     if (!p.iv || !p.iv.length) return false;
     var ex = pad || 0;
@@ -838,6 +1029,48 @@
       if (x >= p.iv[i][0] - ex && x <= p.iv[i][1] + ex) return true;
     }
     return false;
+  }
+
+  // ---- the sticky header -----------------------------------------------
+  // When the visitor scrolls past the hero, #sticky-nav slides down over
+  // the top of the viewport (z-50, above his canvas). If it would cover
+  // him he notices it coming — freezes, eyes up — then crouches until it
+  // slides away or he moves clear. Grounded states only; nothing here
+  // fights the physics.
+  var navEl = null;
+  var navSeenAt = -1; // clock when the overlap began, -1 when clear
+  function navOverlapNow() {
+    if (!navEl) navEl = document.getElementById("sticky-nav");
+    if (!navEl || !navEl.classList.contains("visible")) return false;
+    if (!alex.platform) return false;
+    var grounded =
+      alex.state === "idle" ||
+      alex.state === "run" ||
+      alex.state === "present" ||
+      alex.state === "wave" ||
+      alex.state === "sit";
+    if (!grounded) return false;
+    var nb = navEl.getBoundingClientRect().bottom; // viewport px
+    var headV = alex.y - CH - scrollY; // standing head, viewport px
+    var feetV = alex.y - scrollY;
+    return headV < nb + 2 && feetV > nb - 4;
+  }
+  function navTick() {
+    if (navOverlapNow()) {
+      if (navSeenAt < 0) navSeenAt = clock;
+    } else {
+      navSeenAt = -1;
+    }
+  }
+  function navNoticing() {
+    return navSeenAt >= 0 && clock - navSeenAt < NAV_NOTICE;
+  }
+  function navDucking() {
+    return navSeenAt >= 0 && clock - navSeenAt >= NAV_NOTICE;
+  }
+  function navLooking() {
+    // eyes up from the moment he notices until shortly after crouching
+    return navSeenAt >= 0 && clock - navSeenAt < NAV_NOTICE + 1.2;
   }
 
   function buildPlatforms() {
@@ -880,19 +1113,47 @@
         y2: tr.bottom + scrollY,
       });
     }
+    // overhead clearance per platform: text whose bottom leaves less
+    // than a crouch of headroom carves the interval out entirely; text
+    // that still leaves crouch room keeps the ledge but marks the
+    // x-range as a duck zone (he shuffles through those at a crouch).
+    // STAND_CH is the full sprite height the carve has always used.
+    var STAND_CH = CH;
+    var DUCK_CH = Math.round(CH * DUCK_RATIO);
     for (var n = next.length - 1; n >= 0; n--) {
       var np = next[n];
       var ivs = [[np.x1 + 14, np.x2 - 14]];
-      var z1 = np.y - CH - 8;
+      var ducks = [];
+      var z1 = np.y - STAND_CH - 8;
       var z2 = np.y - 2;
       for (var ri = 0; ri < textRects.length; ri++) {
         var rr = textRects[ri];
         if (rr.y2 <= z1 || rr.y1 >= z2) continue;
-        ivs = subtractInterval(ivs, rr.x1 - CW / 2 - 4, rr.x2 + CW / 2 + 4);
-        if (!ivs.length) break;
+        var a = rr.x1 - CW / 2 - 4;
+        var b = rr.x2 + CW / 2 + 4;
+        if (rr.y2 >= np.y - DUCK_CH) {
+          // no room even to crouch under this text
+          ivs = subtractInterval(ivs, a, b);
+          if (!ivs.length) break;
+        } else if (rr.y2 > np.y - Math.round(STAND_CH * 0.85)) {
+          // meaningfully into his standing height: crouch to pass
+          ducks.push([a, b]);
+        }
+        // else: it barely grazes his hair — no crouching for that
       }
       np.iv = cleanIntervals(ivs);
-      if (!np.iv.length) next.splice(n, 1);
+      if (!np.iv.length) {
+        next.splice(n, 1);
+        continue;
+      }
+      np.duck = mergeIntervals(ducks);
+      // where he can stand fully upright: the preferred landing spots —
+      // ducking is for transit and tight spots, not the default home
+      var stand = np.iv;
+      for (var di = 0; di < np.duck.length; di++) {
+        stand = subtractInterval(stand, np.duck[di][0], np.duck[di][1]);
+      }
+      np.stand = cleanIntervals(stand);
     }
     next.sort(function (a, b) {
       return a.y - b.y;
@@ -918,6 +1179,7 @@
     if (alex.target) alex.target = remap(alex.target);
     if (alex.afterBlip) alex.afterBlip = remap(alex.afterBlip);
     if (alex.anchor) alex.anchor = remap(alex.anchor);
+    if (alex.passThroughTarget) alex.passThroughTarget = remap(alex.passThroughTarget);
     if (DEBUG) drawDebug();
   }
 
@@ -972,6 +1234,22 @@
         (p.x2 - p.x1) +
         "px;height:0;";
       debugLayer.appendChild(d);
+      // duck zones: orange segments floating just above the ledge line
+      (p.duck || []).forEach(function (z) {
+        var zx1 = Math.max(p.x1, z[0]);
+        var zx2 = Math.min(p.x2, z[1]);
+        if (zx2 - zx1 <= 0) return;
+        var o = document.createElement("div");
+        o.style.cssText =
+          "position:absolute;border-top:2px solid rgba(255,150,0,.85);left:" +
+          zx1 +
+          "px;top:" +
+          (p.y - 4) +
+          "px;width:" +
+          (zx2 - zx1) +
+          "px;height:0;";
+        debugLayer.appendChild(o);
+      });
     });
   }
 
@@ -986,6 +1264,12 @@
   var MAX_DROP = 1500; // hard limit for an animated fall
   var CHASE_DROP = 750; // during active scrolling, blip beyond this
   var MAX_JUMP_SPAN = 420;
+  var DUCK_RATIO = 0.66; // crouch height as a fraction of full sprite height
+  var DUCK_PACE = 0.6; // pace multiplier while shuffling through a duck zone
+  var HOP_DOWN_POP = 220; // upward pop (px/s) starting a pass-through descent
+  var IDLE_SIT_AFTER = 12; // s of visitor quiet before he sits down to wait
+  var ATTEND_SETTLE_MS = 350; // scroll-quiet before picking the centred box (touch)
+  var NAV_NOTICE = 0.35; // s he freezes, eyes up, before crouching under the sticky header
 
   var alex = {
     x: 0, // feet centre, document coords
@@ -1013,6 +1297,8 @@
     hops: 0, // cheer hop counter
     cheered: false, // reacted to the contact protocol this run
     jumpFrom: null, // platform he launched from, banned as a landing mid-arc
+    passThroughTarget: null, // hop-down descent: the only ledge that may catch him
+    waitSit: false, // seated waiting for the visitor to come back
     dust: [], // particles {x,y,vx,vy,t,c}
   };
 
@@ -1057,18 +1343,20 @@
 
   function setState(s) {
     if (alex.state === "present" && s !== "present") hideGuideUnderline();
+    if (s !== "sit") alex.waitSit = false;
     alex.state = s;
     alex.stateT = 0;
     alex.animT = 0;
     if (s === "present") showGuideUnderline();
   }
 
-  function platformAt(x, y, slackY, slackX, exclude) {
+  function platformAt(x, y, slackY, slackX, exclude, only) {
     var sx = slackX || 2;
     var best = null;
     for (var i = 0; i < platforms.length; i++) {
       var p = platforms[i];
       if (p === exclude) continue;
+      if (only && p !== only) continue; // pass-through descent: one valid landing
       if (x < p.x1 - sx || x > p.x2 + sx) continue;
       if (!inIntervals(p, x, 8)) continue;
       if (p.y < y - 4) continue;
@@ -1223,12 +1511,11 @@
     return best || bestAny || nearestTo(scrollY + innerHeight * 0.5);
   }
 
-  function spotOn(p, nearX) {
-    if (!p.iv || !p.iv.length) return Math.max(p.x1 + 14, Math.min(p.x2 - 14, nearX));
-    var best = p.iv[0][0] + 2,
+  function snapToIvs(ivs, nearX) {
+    var best = ivs[0][0] + 2,
       bestD = Infinity;
-    for (var i = 0; i < p.iv.length; i++) {
-      var iv = p.iv[i];
+    for (var i = 0; i < ivs.length; i++) {
+      var iv = ivs[i];
       if (nearX >= iv[0] && nearX <= iv[1]) return nearX;
       var dl = Math.abs(nearX - iv[0]);
       if (dl < bestD) {
@@ -1244,19 +1531,81 @@
     return best;
   }
 
+  function spotOn(p, nearX) {
+    // prefer spots with full standing headroom; duck zones are for
+    // transit and tight landings, not the default idle home
+    if (p.stand && p.stand.length) return snapToIvs(p.stand, nearX);
+    if (!p.iv || !p.iv.length) return Math.max(p.x1 + 14, Math.min(p.x2 - 14, nearX));
+    return snapToIvs(p.iv, nearX);
+  }
+
   function blipTo(p) {
     if (!p) return;
     alex.afterBlip = p;
+    alex.passThroughTarget = null;
     alex.quickBlip = offScreenBy() !== 0; // nobody sees the old spot
     setState("blipOut");
   }
 
   /* ---------- the brain: called while idle/running -------------------- */
 
+  // hop-down: a small upward pop, then a fall that ignores every ledge
+  // except the intended target — how he descends INTO the page's
+  // structure (card top → inner project bubble → next card) instead of
+  // de-rezzing every time the visitor scrolls down.
+  function hopDownLegal(t) {
+    if (!t || !alex.platform) return false;
+    var dy = t.y - alex.platform.y;
+    if (dy < 20 || dy > MAX_DROP) return false;
+    // the target must be roughly beneath: horizontal spans overlap
+    var overlap = Math.min(t.x2, alex.platform.x2) - Math.max(t.x1, alex.platform.x1);
+    if (overlap < 30) return false;
+    if (Math.abs(spotOn(t, alex.x) - alex.x) > MAX_JUMP_SPAN) return false;
+    // the pop needs standing headroom at the start of the arc
+    if (duckAt(alex.platform, alex.x)) return false;
+    return true;
+  }
+
+  function hopDown(t) {
+    var tx = spotOn(t, alex.x);
+    var dy = t.y - alex.y;
+    var up = HOP_DOWN_POP;
+    var t1 = up / GRAVITY;
+    var drop = dy + (up * up) / (2 * GRAVITY);
+    var t2 = drop > 0 ? Math.sqrt((2 * drop) / GRAVITY) : 0;
+    var T = Math.max(0.22, t1 + t2);
+    alex.vy = -up;
+    alex.vx = (tx - alex.x) / T;
+    alex.dir = alex.vx >= 0 ? 1 : -1;
+    alex.jumpFrom = alex.platform;
+    alex.passThroughTarget = t;
+    alex.target = t;
+    alex.hurry = true;
+    setState("jump");
+  }
+
   function moveToward(target) {
     if (!target) return;
+    // already committed and en route: re-planning every think() tick
+    // churns targetX (spotOn can flip between interval ends) and reads
+    // as a left-right vibration — stay the course instead
+    if (alex.state === "run" && alex.target === target) return;
     var dy = target.y - alex.y;
     var off = offScreenBy();
+    // following a downward scroll: prefer dropping through the page's
+    // structure over a de-rez — unless it is a genuine teleport (very
+    // far, or he is deep off screen: "never off screen for more than a
+    // beat" still wins)
+    if (
+      dy > 0 &&
+      hopDownLegal(target) &&
+      dy <= innerHeight * 1.6 &&
+      Math.abs(off) <= 400 &&
+      (!reachable(target) || (Math.abs(dy) > CHASE_DROP && scrollingHard()))
+    ) {
+      hopDown(target);
+      return;
+    }
     // beyond animation range, deep off screen, or the visitor is
     // actively flying past: de-rez straight there instead of arriving
     // late (a chain of climbs from below the fold takes seconds)
@@ -1417,6 +1766,30 @@
       }
     }
 
+    // --- the visitor went quiet: sit down and wait for them ------------
+    if (
+      alex.state === "idle" &&
+      alex.platform &&
+      !cursorRecent(IDLE_SIT_AFTER * 1000) &&
+      performance.now() - lastScrollAt > IDLE_SIT_AFTER * 1000
+    ) {
+      var wEdge = nearestLedgeEdgeX();
+      var wDist = Math.abs(wEdge - alex.x);
+      if (wDist >= 14 && wDist <= 120) {
+        // a ledge edge is close: amble over so the seated legs dangle
+        alex.target = null;
+        alex.targetX = wEdge;
+        alex.pace = 120;
+        setState("run");
+      } else {
+        // sit right here until the cursor moves or a scroll happens
+        alex.waitSit = true;
+        alex.sitUntil = Infinity;
+        setState("sit");
+      }
+      return;
+    }
+
     // --- flavour on the furniture --------------------------------------
     if (
       alex.state === "idle" &&
@@ -1443,11 +1816,12 @@
       }
     }
 
-    if (alex.state === "idle" && alex.idleFor > alex.nextWanderAt) {
-      alex.nextWanderAt = alex.idleFor + 6 + Math.random() * 5;
+    if (alex.state === "idle" && alex.idleFor > alex.nextWanderAt && !navDucking()) {
+      // unhurried: he keeps still far more than he roams
+      alex.nextWanderAt = alex.idleFor + 11 + Math.random() * 8;
       alex.pace = RUN_BASE();
       // sometimes, parkour to a neighbouring ledge for fun
-      if (Math.random() < 0.12) {
+      if (Math.random() < 0.08) {
         var hopTo = null,
           hopD = Infinity;
         var near = nearPlatforms();
@@ -1472,11 +1846,11 @@
           return;
         }
       }
-      // otherwise stroll a decent stretch of the current ledge
+      // otherwise stroll a short stretch of the current ledge
       alex.target = null;
       alex.targetX = spotOn(
         alex.platform,
-        alex.x + (Math.random() < 0.5 ? -1 : 1) * (60 + Math.random() * 100)
+        alex.x + (Math.random() < 0.5 ? -1 : 1) * (40 + Math.random() * 70)
       );
       if (Math.abs(alex.targetX - alex.x) > 12) setState("run");
     }
@@ -1497,6 +1871,26 @@
     alex.dir = alex.vx >= 0 ? 1 : -1;
     alex.jumpFrom = alex.platform;
     setState("jump");
+  }
+
+  // jumps may not start under a low ceiling — the arc would clip the
+  // text overhead. From a duck zone he walks to the nearest standing
+  // spot first (or de-rezzes if the zone has boxed him in entirely).
+  function launchOrWalkOut(t) {
+    var pl = alex.platform;
+    if (pl && duckAt(pl, alex.x)) {
+      if (pl.stand && pl.stand.length) {
+        var out = snapToIvs(pl.stand, alex.x);
+        if (Math.abs(out - alex.x) > 4) {
+          alex.targetX = out; // keep running (crouched) toward clear air
+          return;
+        }
+      } else {
+        blipTo(t);
+        return;
+      }
+    }
+    launchToward(t);
   }
 
   function step(dt) {
@@ -1576,6 +1970,17 @@
         break;
 
       case "sit": {
+        // seated waiting for an absent visitor: any input wakes him
+        if (
+          alex.waitSit &&
+          (cursorRecent(600) || performance.now() - lastScrollAt < 600)
+        ) {
+          alex.waitSit = false;
+          alex.idleFor = 0;
+          alex.nextWanderAt = 2 + Math.random() * 3;
+          setState("idle");
+          break;
+        }
         var sitHover = hoverPlatform();
         if (sitHover === alex.platform && sitHover) {
           // the visitor is still on this box: keep him company
@@ -1641,8 +2046,20 @@
       case "run": {
         var goal = alex.targetX;
         var sp = alex.hurry ? HURRY_SPEED : alex.pace;
-        alex.dir = goal > alex.x ? 1 : -1;
-        alex.x += alex.dir * sp * dt;
+        // under a low ceiling he shuffles: no sprinting through duck zones
+        if (duckAt(alex.platform, alex.x)) sp *= DUCK_PACE;
+        // the sticky header is sliding in overhead: freeze for a beat
+        // and look up before crouching on (movement resumes below)
+        if (navNoticing()) {
+          if (alex.state === "run") think(dt);
+          break;
+        }
+        var gap = goal - alex.x;
+        // dir hysteresis + a stride clamp: at sprint speed one frame's
+        // step is wider than the settle band, and an uncapped stride
+        // made him overshoot and vibrate around the goal
+        if (Math.abs(gap) > 1) alex.dir = gap > 0 ? 1 : -1;
+        alex.x += alex.dir * Math.min(sp * dt, Math.abs(gap));
 
         var pl = alex.platform;
         if (pl) {
@@ -1654,18 +2071,19 @@
                 break;
               }
             }
-            launchToward(t);
+            launchOrWalkOut(t);
             break;
           }
           alex.x = Math.max(pl.x1 + 2, Math.min(pl.x2 - 2, alex.x));
         }
         if (Math.abs(alex.x - goal) < 6) {
+          alex.x = Math.max(pl ? pl.x1 + 2 : alex.x, Math.min(pl ? pl.x2 - 2 : alex.x, goal));
           if (alex.target && alex.target !== alex.platform) {
             var t2 = alex.target;
             if (t2.y < alex.y - 12) {
               setState("climb");
             } else {
-              launchToward(t2);
+              launchOrWalkOut(t2);
             }
           } else {
             alex.idleFor = 0;
@@ -1694,6 +2112,12 @@
         // target, the one he launched from is not a landing: catching it
         // mid arc used to bounce him on the spot forever when the target
         // sat directly below.
+        // A pass-through descent ignores every ledge except its target
+        // until he lands on it or falls past it (then normal rules
+        // resume as the safety net).
+        if (alex.passThroughTarget && alex.y > alex.passThroughTarget.y + 40) {
+          alex.passThroughTarget = null;
+        }
         var ban =
           alex.target && alex.jumpFrom !== alex.target ? alex.jumpFrom : null;
         var landOn = platformAt(
@@ -1701,13 +2125,15 @@
           alex.y - 20,
           Math.max(26, alex.vy * dt * 2),
           Math.abs(alex.vx * dt) + 4,
-          ban
+          ban,
+          alex.passThroughTarget
         );
         if (landOn && alex.y >= landOn.y - 2) {
           alex.y = landOn.y;
           alex.platform = landOn;
           alex.target = null;
           alex.jumpFrom = null;
+          alex.passThroughTarget = null;
           alex.vx = 0;
           alex.vy = 0;
           spawnDust();
@@ -1800,6 +2226,19 @@
 
   function currentFrame() {
     var t = alex.animT;
+    // under a low ceiling every grounded pose becomes the crouch: a
+    // slow bob while still, a quicker duckA/duckB shuffle while moving.
+    // The sticky header sliding in overhead counts as a low ceiling too
+    // (after the notice beat — he first freezes and looks up).
+    if (
+      (alex.state === "idle" ||
+        alex.state === "run" ||
+        alex.state === "present" ||
+        alex.state === "wave") &&
+      (duckAt(alex.platform, alex.x) || navDucking())
+    ) {
+      return Math.floor(t / (alex.state === "run" ? 0.16 : 0.5)) % 2 ? "duckB" : "duckA";
+    }
     switch (alex.state) {
       case "idle": {
         if (t > alex.blinkAt && t < alex.blinkAt + 0.14) return "blink";
@@ -1864,7 +2303,15 @@
       // front-facing frames (the faces are symmetric, so the eye cells
       // sit at x=8 and x=11 in both bakes)
       var row = EYE_ROW[frame];
-      if (row !== undefined && cursorRecent(6000)) {
+      if (row !== undefined && navLooking()) {
+        // the sticky header is sliding in overhead: eyes up
+        ctx.fillStyle = PAL.s;
+        ctx.fillRect(8, row, 1, 1);
+        ctx.fillRect(11, row, 1, 1);
+        ctx.fillStyle = PAL.e;
+        ctx.fillRect(8, row - 1, 1, 1);
+        ctx.fillRect(11, row - 1, 1, 1);
+      } else if (row !== undefined && cursorRecent(6000)) {
         var dx = cursorDocX() - alex.x;
         var dyE = cursorDocY() - (alex.y - CH * 0.75);
         var ox = dx < -26 ? -1 : dx > 26 ? 1 : 0;
@@ -1936,6 +2383,8 @@
     lastScrollY = scrollY;
     scrollVel = scrollVel * 0.8 + inst * 0.2;
 
+    touchAttend(ts); // touch analogue of hover attention (no-op with a mouse)
+    navTick(); // does the sticky header overlap him this frame?
     step(dt);
 
     // render throttle: deep idle (nothing moving, nobody interacting)
@@ -1944,6 +2393,7 @@
       (alex.state === "idle" || alex.state === "sit") &&
       !alex.dust.length &&
       !cursorRecent(3000) &&
+      !navLooking() &&
       performance.now() - lastScrollAt > 3000;
     if (!deepIdle || tick % 5 === 0) render();
 
@@ -1952,6 +2402,7 @@
 
   function start() {
     if (!enabled) return;
+    applyScale();
     buildPlatforms();
     if (!platforms.length) return;
     var t = pickTarget(0) || platforms[0];
@@ -1977,6 +2428,7 @@
     clearTimeout(rebuildTimer);
     rebuildTimer = setTimeout(function () {
       if (!enabled) return;
+      applyScale(); // rotation / resize may have changed the sprite scale
       buildPlatforms();
       if (alex.platform && (alex.state === "idle" || alex.state === "sit")) {
         alex.y = alex.platform.y;
@@ -2005,8 +2457,33 @@
     } catch (e) {}
   }
 
-  // the easter egg: clicking Alexander's name in the header (works on
-  // touch too) or the portrait (desktop only) toggles pixel mode
+  // a brief glow on the name so a tap visibly registers before the
+  // sprite blips in (and a shorter fade-out when disabling). Inline
+  // styles are restored afterwards — no permanent DOM/style pollution.
+  function pulseName(on) {
+    var name = document.querySelector("#main-header h1");
+    if (!name) return;
+    var prevTransition = name.style.transition;
+    var prevShadow = name.style.textShadow;
+    name.style.transition = "text-shadow 0.15s ease";
+    name.style.textShadow = on
+      ? "0 0 18px rgba(0,224,90,0.9)"
+      : "0 0 8px rgba(0,224,90,0.4)";
+    setTimeout(function () {
+      name.style.textShadow = prevShadow;
+      setTimeout(function () {
+        name.style.transition = prevTransition;
+        if (!name.getAttribute("style")) name.removeAttribute("style");
+      }, 300);
+    }, on ? 600 : 250);
+  }
+
+  // the easter egg: clicking/tapping Alexander's name in the header (a
+  // tap fires a normal click event) or the portrait (desktop only)
+  // toggles pixel mode. The timestamp guard swallows any synthetic
+  // second click a touch tap might produce.
+  var lastToggleAt = 0;
+
   function installEasterEgg() {
     var triggers = [];
     var name = document.querySelector("#main-header h1");
@@ -2015,8 +2492,12 @@
     if (portrait) triggers.push(portrait.closest(".group") || portrait);
     triggers.forEach(function (el) {
       el.addEventListener("click", function () {
+        var now = performance.now();
+        if (now - lastToggleAt < 400) return;
+        lastToggleAt = now;
         var on = !enabled;
         storeMode(on);
+        pulseName(on);
         if (on) {
           enable();
         } else {
@@ -2050,19 +2531,69 @@
   }
 
   window.addEventListener("resize", scheduleRebuild);
+  window.addEventListener("orientationchange", scheduleRebuild);
   window.addEventListener("load", scheduleRebuild);
   if (document.fonts && document.fonts.ready) document.fonts.ready.then(scheduleRebuild);
 
   document.addEventListener("visibilitychange", function () {
     if (!enabled) return;
-    running = !document.hidden;
-    if (running && !raf) {
-      last = performance.now();
-      raf = requestAnimationFrame(loop);
+    if (document.hidden) {
+      // sit tight where he is until the visitor comes back; he stands
+      // again a beat after the tab returns (the clock is frozen while
+      // hidden, so the timer only runs once the loop resumes)
+      if (
+        alex.platform &&
+        (alex.state === "idle" ||
+          alex.state === "run" ||
+          alex.state === "present" ||
+          alex.state === "wave")
+      ) {
+        alex.target = null;
+        alex.dir = scrollX + innerWidth / 2 >= alex.x ? 1 : -1; // face the viewport centre
+        alex.sitUntil = clock + 0.4;
+        setState("sit");
+        render();
+      }
+      running = false;
+    } else {
+      running = true;
+      if (!raf) {
+        last = performance.now();
+        raf = requestAnimationFrame(loop);
+      }
+    }
+  });
+
+  // the voice widget broadcasts its call state; the first non-idle
+  // state after idle means a call is connecting — worth a cheer. The
+  // widget is position:fixed, so that is all he can do about it. If the
+  // widget never loads this listener simply never fires.
+  var voiceState = "idle";
+  addEventListener("alexvoice:state", function (e) {
+    var s = e && e.detail && e.detail.state ? String(e.detail.state) : "";
+    if (!s) return;
+    var prev = voiceState;
+    voiceState = s;
+    if (!enabled || prev !== "idle" || s === "idle") return;
+    var grounded =
+      alex.platform &&
+      (alex.state === "idle" ||
+        alex.state === "run" ||
+        alex.state === "wave" ||
+        alex.state === "sit" ||
+        alex.state === "present" ||
+        alex.state === "land");
+    if (grounded) {
+      alex.hops = 0;
+      alex.vy = -300;
+      setState("cheer");
     }
   });
 
   function boot() {
+    // the easter egg always installs — even under prefers-reduced-motion,
+    // where he simply never auto-starts (a stored opt-in was an explicit
+    // tap, so it is honoured; a fresh tap is an informed opt-in too)
     installEasterEgg();
     if (storedModeOn()) enable();
   }
