@@ -92,8 +92,18 @@ const rateBuckets = new Map(); // "key:ip" -> [timestampMs, ...]
 let lastPrune = 0;
 const PRUNE_INTERVAL_MS = 60_000;
 const MAX_WINDOW_MS = 60 * 60_000;
+const MAX_BUCKETS = 5000; // hard cap on tracked client buckets per instance
 
 function clientIp(req) {
+  // Prefer platform-set headers that clients cannot spoof. Vercel sets
+  // x-vercel-forwarded-for / x-real-ip itself; a client-supplied
+  // x-forwarded-for is only a fallback for other runtimes (and is the
+  // reason it comes last).
+  const trusted =
+    req.headers?.["x-vercel-forwarded-for"] || req.headers?.["x-real-ip"];
+  if (typeof trusted === "string" && trusted.length > 0) {
+    return trusted.split(",")[0].trim();
+  }
   const fwd = req.headers?.["x-forwarded-for"];
   if (typeof fwd === "string" && fwd.length > 0) {
     return fwd.split(",")[0].trim();
@@ -121,6 +131,22 @@ export function rateLimit(req, res, key, limit, windowMs) {
   const bucketKey = `${key}:${clientIp(req)}`;
   let hits = rateBuckets.get(bucketKey);
   if (!hits) {
+    // Memory guard: a caller minting unique client IPs must not balloon
+    // the bucket map between prunes. Force a prune at the cap; if the
+    // map is still saturated with live buckets, fail closed.
+    if (rateBuckets.size >= MAX_BUCKETS) {
+      lastPrune = now;
+      for (const [k, h] of rateBuckets) {
+        if (h.length === 0 || now - h[h.length - 1] > MAX_WINDOW_MS) {
+          rateBuckets.delete(k);
+        }
+      }
+      if (rateBuckets.size >= MAX_BUCKETS) {
+        res.setHeader("Retry-After", "60");
+        sendJson(res, 429, { error: "busy" });
+        return false;
+      }
+    }
     hits = [];
     rateBuckets.set(bucketKey, hits);
   }
