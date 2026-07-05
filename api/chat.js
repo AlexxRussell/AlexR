@@ -110,7 +110,10 @@ function sseWrite(res, obj) {
 // The persona forbids em/en dashes, but models slip: swap any that get
 // through for a comma so neither the transcript nor the TTS sees them.
 export function deDash(s) {
-  return s.replace(/\s*[—–]+\s*/g, ", ");
+  return s
+    .replace(/\s*[—–]+\s*/g, ", ")
+    .replace(/,\s*,/g, ",")
+    .replace(/ {2,}/g, " ");
 }
 
 export default async function handler(req, res) {

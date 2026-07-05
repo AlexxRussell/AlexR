@@ -24,6 +24,15 @@ const UPSTREAM_TIMEOUT_MS = 30_000;
 export function sanitizeText(raw) {
   return raw
     .replace(/[*_#`~]/g, "")
+    // Speech-normalize contacts: the persona writes them with real symbols
+    // (me@alexrussell.io) so transcripts look right; audio needs the words.
+    // Emails first (their domain loses its dots here, so the domain rule
+    // below cannot double-process them).
+    .replace(/([A-Za-z0-9._%+-]+)@((?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,})/g,
+      (m, user, dom) => user + " at " + dom.replace(/\./g, " dot "))
+    .replace(/\b((?:[A-Za-z0-9-]+\.)+(?:io|com|nz|ai|dev|org|net|co))\b(\/[A-Za-z0-9\-/]*)?/g,
+      (m, dom, path) => dom.replace(/\./g, " dot ") +
+        (path ? " slash " + path.slice(1).replace(/\//g, " slash ") : ""))
     .replace(/\s*[–—]+\s*/g, ", ") // persona forbids dashes; belt and braces
     .replace(/[\u0000-\u001f\u007f]/g, " ")
     .replace(/\s+/g, " ")

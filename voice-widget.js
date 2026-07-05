@@ -189,7 +189,7 @@ const STATE_LINES = {
     connecting: '> CONNECTING…',
     listening: '> LISTENING…',
     thinking: '> THINKING…',
-    speaking: '> SPEAKING — tap to interrupt',
+    speaking: '> SPEAKING, tap to interrupt',
 };
 
 // ---------- SHADOW DOM TEMPLATE ----------
@@ -513,7 +513,7 @@ const WIDGET_CSS = `
 `;
 
 const WIDGET_HTML = `
-    <button class="launcher" type="button" aria-label="Ask Alex AI — open the voice assistant">
+    <button class="launcher" type="button" aria-label="Ask Alex AI, open the voice assistant">
         <canvas class="mini" width="24" height="24" aria-hidden="true"></canvas>
         <span class="llabel">ASK ALEX_AI</span>
         <span class="dot" aria-hidden="true"></span>
@@ -556,7 +556,7 @@ class AlexVoiceWidget extends HTMLElement {
         this.callActive = false;
         this.voiceMode = false;
         this.micMuted = false;
-        this.history = [];          // {role, content} — last HISTORY_MAX kept
+        this.history = [];          // {role, content}, last HISTORY_MAX kept
         this.turn = null;           // active agent turn (chat + tts + playback)
         this.utteranceId = 0;       // bumped per turn / interrupt; tags everything
 
@@ -689,7 +689,7 @@ class AlexVoiceWidget extends HTMLElement {
             this.startBtn.hidden = true;
             this.textBtn.textContent = 'START LINK (TEXT)';
             this.card.querySelector('.consent').innerHTML =
-                'Voice input is not supported in this browser — type instead;<br>' +
+                'Voice input is not supported in this browser, type instead;<br>' +
                 'replies are still spoken.';
         }
 
@@ -721,7 +721,7 @@ class AlexVoiceWidget extends HTMLElement {
         }
         this.statelineEl.classList.remove('notice');
         let line = STATE_LINES[this.state] || '> STANDBY';
-        if (this.state === 'listening' && !this.voiceMode) line = '> READY — type below';
+        if (this.state === 'listening' && !this.voiceMode) line = '> READY, type below';
         this.statelineEl.textContent = line;
     }
 
@@ -771,14 +771,14 @@ class AlexVoiceWidget extends HTMLElement {
 
         let voice = withVoice && !!SR_CTOR;
         if (withVoice && !SR_CTOR) {
-            this.sysMsg('voice input unsupported here — text mode enabled; replies are still spoken.');
+            this.sysMsg('voice input unsupported here, text mode enabled; replies are still spoken.');
         }
         if (voice) {
             try {
                 await this.ensureMic();
             } catch (e) {
                 voice = false;
-                this.sysMsg('mic unavailable — text mode enabled; replies are still spoken.');
+                this.sysMsg('mic unavailable, text mode enabled; replies are still spoken.');
             }
         }
         if (audioOk) {
@@ -1043,7 +1043,7 @@ class AlexVoiceWidget extends HTMLElement {
         const track = stream.getAudioTracks()[0];
         if (track) {
             track.onended = () => {
-                if (this.callActive) this.enterTextMode('mic disconnected — text mode enabled.');
+                if (this.callActive) this.enterTextMode('mic disconnected, text mode enabled.');
             };
         }
         if (this.ctx) {
@@ -1052,7 +1052,7 @@ class AlexVoiceWidget extends HTMLElement {
             this.micAnalyser.fftSize = 2048;
             this.micAnalyser.smoothingTimeConstant = 0.5;
             this.micBuf = new Uint8Array(this.micAnalyser.fftSize);
-            this.micSource.connect(this.micAnalyser);  // analysis only — never to destination
+            this.micSource.connect(this.micAnalyser);  // analysis only, never to destination
         }
     }
 
@@ -1091,7 +1091,7 @@ class AlexVoiceWidget extends HTMLElement {
             rec.onresult = (e) => this.onSpeechResult(e);
             rec.onerror = (e) => {
                 if (e.error === 'not-allowed' || e.error === 'service-not-allowed') {
-                    this.enterTextMode('mic access blocked — text mode enabled.');
+                    this.enterTextMode('mic access blocked, text mode enabled.');
                 }
                 // 'no-speech' / 'network' / 'aborted' fall through to onend → restart
             };
@@ -1537,7 +1537,7 @@ class AlexVoiceWidget extends HTMLElement {
         } else {
             this.sttEngine = null;
             dbg.sttEngine = null;
-            this.enterTextMode('voice input hiccuped — text mode enabled; replies are still spoken.');
+            this.enterTextMode('voice input hiccuped, text mode enabled; replies are still spoken.');
         }
     }
 
@@ -1648,14 +1648,14 @@ class AlexVoiceWidget extends HTMLElement {
             });
         } catch (e) {
             clearTimeout(watchdog);
-            if (turn.id === this.utteranceId) this.turnError('connection hiccup — try again in a moment.');
+            if (turn.id === this.utteranceId) this.turnError('connection hiccup, try again in a moment.');
             return;
         }
         if (turn.id !== this.utteranceId) { clearTimeout(watchdog); return; }
         if (res.status === 429) { clearTimeout(watchdog); this.rateLimitedTurn(); return; }
         if (!res.ok || !res.body) {
             clearTimeout(watchdog);
-            this.turnError('the agent glitched — try again.');
+            this.turnError('the agent glitched, try again.');
             return;
         }
         const reader = res.body.getReader();
@@ -1681,7 +1681,7 @@ class AlexVoiceWidget extends HTMLElement {
                         } else if (ev.done) {
                             this.onChatDone(turn);
                         } else if (ev.error) {
-                            this.turnError('the agent glitched — try again.');
+                            this.turnError('the agent glitched, try again.');
                             return;
                         }
                     }
@@ -1689,7 +1689,7 @@ class AlexVoiceWidget extends HTMLElement {
             }
             if (turn.id === this.utteranceId && !turn.chatDone) this.onChatDone(turn);
         } catch (e) {
-            if (turn.id === this.utteranceId) this.turnError('connection dropped — try again.');
+            if (turn.id === this.utteranceId) this.turnError('connection dropped, try again.');
         } finally {
             clearTimeout(watchdog);
             if (this.chatCtrl === ctrl) this.chatCtrl = null;
@@ -1721,7 +1721,7 @@ class AlexVoiceWidget extends HTMLElement {
         while ((m = re.exec(turn.pending))) {
             const end = m.index + m[1].length;
             const cand = turn.pending.slice(consumed, end).trim();
-            if (ABBREV_TAIL.test(cand)) continue;      // "Dr." / "e.g." — not a boundary
+            if (ABBREV_TAIL.test(cand)) continue;      // "Dr." / "e.g.", not a boundary
             this.queueSentence(turn, cand);
             consumed = m.index + m[0].length;
         }
@@ -1776,7 +1776,7 @@ class AlexVoiceWidget extends HTMLElement {
                     if (job.turn.id !== this.utteranceId) continue;
                     if (e && e.rateLimited) {
                         dbg.rateLimited++;
-                        this.noticeFor('> RATE LIMITED — one sec', 2500);
+                        this.noticeFor('> RATE LIMITED, one sec', 2500);
                         this.ttsQueue.length = 0;       // don't hammer the limiter
                     } else if (e && e.name !== 'AbortError') {
                         dbg.errors++;
@@ -1808,7 +1808,7 @@ class AlexVoiceWidget extends HTMLElement {
                 throw new Error('tts_error_payload');
             }
             const reader = res.body.getReader();
-            let carry = null;   // odd trailing byte — an Int16 split across chunks
+            let carry = null;   // odd trailing byte, an Int16 split across chunks
             for (;;) {
                 const { done, value } = await reader.read();
                 if (uid !== this.utteranceId) { try { ctrl.abort(); } catch (e) { /* ignore */ } return; }
@@ -1952,8 +1952,8 @@ class AlexVoiceWidget extends HTMLElement {
 
     rateLimitedTurn() {
         dbg.rateLimited++;
-        this.noticeFor('> RATE LIMITED — one sec', 2500);
-        this.sysMsg('rate limited — give it a moment, then ask again.');
+        this.noticeFor('> RATE LIMITED, one sec', 2500);
+        this.sysMsg('rate limited, give it a moment, then ask again.');
         this.clearPendingPcm();
         if (this.turn) {
             this.utteranceId++;
@@ -2036,7 +2036,7 @@ class AlexVoiceWidget extends HTMLElement {
         if (!this.callDeadline || !this.callActive) return;
         const left = this.callDeadline - performance.now();
         if (left <= 0) {
-            this.sysMsg("time's up — thanks for the chat! start another call anytime.");
+            this.sysMsg("time's up, thanks for the chat! start another call anytime.");
             this.endCall();
             return;
         }

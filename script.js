@@ -262,7 +262,7 @@ async function askAlex(question) {
 
     alexChat.history.push({ role: 'user', content: question });
     let reply = '';
-    let failText = 'link hiccup — try again in a moment.';
+    let failText = 'link hiccup, try again in a moment.';
     try {
         const res = await fetch('/api/chat', {
             method: 'POST',
@@ -270,7 +270,7 @@ async function askAlex(question) {
             body: JSON.stringify({ messages: alexChat.history.slice(-14) }),
         });
         if (!res.ok || !res.body) {
-            if (res.status === 429) failText = 'rate limited — give it a beat and try again.';
+            if (res.status === 429) failText = 'rate limited, give it a beat and try again.';
             throw new Error('http');
         }
         loaderEl.remove();
@@ -296,7 +296,7 @@ async function askAlex(question) {
                     historyEl.scrollTop = historyEl.scrollHeight;
                 }
                 if (ev.error) {
-                    if (ev.error === 'rate_limited') failText = 'rate limited — give it a beat and try again.';
+                    if (ev.error === 'rate_limited') failText = 'rate limited, give it a beat and try again.';
                     throw new Error('upstream');
                 }
             }
