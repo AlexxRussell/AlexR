@@ -325,23 +325,24 @@
                     </div>
 
                     <div id="content-chat" role="tabpanel" aria-labelledby="tab-chat" class="hidden p-5 h-full flex flex-col overflow-hidden">
-                        <div id="chat-history" class="flex-1 overflow-y-auto text-xs font-mono space-y-4 mb-4 pr-2 text-gray-300">
+                        <div id="chat-history" class="flex-1 overflow-y-auto text-xs font-mono space-y-4 mb-3 pr-2 text-gray-300" aria-live="polite">
                             <div class="mb-2">
-                                <span class="text-green-500">ALEX_AGENT ></span> Hello! I am Alexander's personal agent. How can I help you today?
+                                <span class="text-green-500">ALEX_AGENT ></span> Hello! I am Alexander's personal agent, live and unscripted. Ask me anything about his work.
                             </div>
                         </div>
-                        
-                        <div class="grid grid-cols-1 gap-2 flex-shrink-0">
-                            <button onclick="askQuestion('who')" aria-label="Ask: Who is Alexander?" class="w-full text-left text-[10px] border border-gray-700 hover:border-green-500 hover:text-green-400 p-2 rounded bg-black/40 transition-colors">
-                                > Who is Alexander?
-                            </button>
-                            <button onclick="askQuestion('stack')" aria-label="Ask: What is his tech stack?" class="w-full text-left text-[10px] border border-gray-700 hover:border-green-500 hover:text-green-400 p-2 rounded bg-black/40 transition-colors">
-                                > What is his tech stack?
-                            </button>
-                            <button onclick="askQuestion('contact')" aria-label="Ask: How do I contact him?" class="w-full text-left text-[10px] border border-gray-700 hover:border-green-500 hover:text-green-400 p-2 rounded bg-black/40 transition-colors">
-                                > How do I contact him?
-                            </button>
+
+                        <div id="chat-chips" class="flex flex-wrap gap-2 mb-2 flex-shrink-0">
+                            <button onclick="askAlex('Who is Alexander?')" class="text-[10px] border border-gray-700 hover:border-green-500 hover:text-green-400 px-2 py-1 rounded bg-black/40 transition-colors">> who</button>
+                            <button onclick="askAlex('What is his tech stack?')" class="text-[10px] border border-gray-700 hover:border-green-500 hover:text-green-400 px-2 py-1 rounded bg-black/40 transition-colors">> stack</button>
+                            <button onclick="askAlex('What has Alexander built?')" class="text-[10px] border border-gray-700 hover:border-green-500 hover:text-green-400 px-2 py-1 rounded bg-black/40 transition-colors">> projects</button>
+                            <button onclick="askAlex('Is he available for work, and how do I contact him?')" class="text-[10px] border border-gray-700 hover:border-green-500 hover:text-green-400 px-2 py-1 rounded bg-black/40 transition-colors">> hire</button>
+                            <button onclick="openVoiceLink()" aria-label="Open the voice assistant" class="text-[10px] border border-gray-700 hover:border-green-500 hover:text-green-400 px-2 py-1 rounded bg-black/40 transition-colors">&#128264; voice</button>
                         </div>
+
+                        <form id="chat-form" class="flex gap-2 flex-shrink-0" onsubmit="return sendChatForm(event)">
+                            <input id="chat-input" type="text" maxlength="500" autocomplete="off" placeholder="ask the agent anything…" aria-label="Ask Alexander's agent a question" class="flex-1 min-w-0 bg-black/40 border border-gray-700 focus:border-green-500 rounded px-2 py-2 text-[11px] font-mono text-gray-200 outline-none placeholder-gray-600 transition-colors">
+                            <button id="chat-send" type="submit" aria-label="Send question" class="border border-gray-700 hover:border-green-500 text-green-500 hover:text-green-400 px-3 rounded text-xs font-mono transition-colors">>></button>
+                        </form>
                     </div>
 
                 </div>
@@ -876,7 +877,7 @@
 
     </main>
 
-    <script src="script.js" defer></script>
+    <script src="script.js?v=2" defer></script>
     <script src="pixel-alex.js?v=5" defer></script>
     <script src="voice-widget.js?v=3" defer></script>
 

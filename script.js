@@ -208,67 +208,122 @@ function switchTab(tab) {
     }
 }
 
-let alexAgentBusy = false;
+// --- 5b. ALEX_AGENT CHAT: the real agent, same brain as the voice link ---
+// Streams from /api/chat (persona lives server-side). The old canned
+// answers are gone; this is live.
+const alexChat = {
+    history: [{ role: 'assistant', content: "Hello! I am Alexander's personal agent, live and unscripted. Ask me anything about his work." }],
+    busy: false,
+};
 
-function askQuestion(type) {
-    if (alexAgentBusy) return; // ignore clicks while a response is streaming
-    const history = document.getElementById('chat-history');
-    let question = "";
-    let answer = "";
+function chatUiBusy(busy) {
+    alexChat.busy = busy;
+    document.querySelectorAll('#chat-chips button, #chat-send').forEach((b) => { b.disabled = busy; });
+    const input = document.getElementById('chat-input');
+    if (input) input.disabled = busy;
+}
 
-    if (type === 'who') {
-        question = "Who is Alexander?";
-        answer = "Alexander is an AI Engineer and Agentic Systems Architect who bridges technical execution with business strategy. He has been automating professionally since late 2021 and currently serves as a contract AI Engineer for Harkness AI and a contributor to the AI Forum NZ LLM Working Group.";
-    } else if (type === 'stack') {
-        question = "What is his tech stack?";
-        answer = "He leverages a multi-model intelligence layer using OpenAI, Claude, and Gemini. He specialises in Model Context Protocol (MCP) servers, RAG pipelines, and secure Supabase backends, orchestrated through Next.js, TypeScript, and Python for scalable production systems.";
-    } else if (type === 'contact') {
-        question = "How do I contact him?";
-        answer = "You can email him at me@alexrussell.io or run the Contact Protocol on the right!";
+function sendChatForm(ev) {
+    ev.preventDefault();
+    const input = document.getElementById('chat-input');
+    const q = (input && input.value ? input.value : '').trim();
+    if (q) {
+        input.value = '';
+        askAlex(q);
     }
+    return false;
+}
 
-    alexAgentBusy = true;
+async function askAlex(question) {
+    if (alexChat.busy) return;
+    question = String(question || '').trim().slice(0, 500);
+    if (!question) return;
+    const historyEl = document.getElementById('chat-history');
+    chatUiBusy(true);
 
-    // Append Question
     const qEl = document.createElement('div');
-    qEl.className = "mb-2 text-right";
-    qEl.innerHTML = `<span class="text-gray-400">> ${question}</span>`;
-    history.appendChild(qEl);
+    qEl.className = 'mb-2 text-right';
+    const qSpan = document.createElement('span');
+    qSpan.className = 'text-gray-400';
+    qSpan.textContent = '> ' + question;
+    qEl.appendChild(qSpan);
+    historyEl.appendChild(qEl);
 
-    // Show thinking loader
     const loaderEl = document.createElement('div');
-    loaderEl.className = "mb-4 flex items-center gap-2";
-    loaderEl.innerHTML = `<span class="text-green-500">ALEX_AGENT ></span> <span class="thinking-dots"><span>.</span><span>.</span><span>.</span></span>`;
-    history.appendChild(loaderEl);
-    history.scrollTop = history.scrollHeight;
+    loaderEl.className = 'mb-4 flex items-center gap-2';
+    loaderEl.innerHTML = '<span class="text-green-500">ALEX_AGENT ></span> <span class="thinking-dots"><span>.</span><span>.</span><span>.</span></span>';
+    historyEl.appendChild(loaderEl);
+    historyEl.scrollTop = historyEl.scrollHeight;
 
-    // After a brief think, stream the answer character by character (typewriter effect)
-    setTimeout(() => {
+    const aEl = document.createElement('div');
+    aEl.className = 'mb-4';
+    aEl.innerHTML = '<span class="text-green-500">ALEX_AGENT ></span> <span class="agent-answer"></span><span class="terminal-cursor"></span>';
+    const answerSpan = aEl.querySelector('.agent-answer');
+
+    alexChat.history.push({ role: 'user', content: question });
+    let reply = '';
+    let failText = 'link hiccup — try again in a moment.';
+    try {
+        const res = await fetch('/api/chat', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ messages: alexChat.history.slice(-14) }),
+        });
+        if (!res.ok || !res.body) {
+            if (res.status === 429) failText = 'rate limited — give it a beat and try again.';
+            throw new Error('http');
+        }
         loaderEl.remove();
-        const aEl = document.createElement('div');
-        aEl.className = "mb-4";
-        aEl.innerHTML = `<span class="text-green-500">ALEX_AGENT ></span> <span class="agent-answer"></span><span class="terminal-cursor"></span>`;
-        history.appendChild(aEl);
-
-        const answerSpan = aEl.querySelector('.agent-answer');
-        const cursor = aEl.querySelector('.terminal-cursor');
-        let i = 0;
-
-        const typeChar = () => {
-            if (i < answer.length) {
-                answerSpan.textContent += answer.charAt(i);
-                i++;
-                history.scrollTop = history.scrollHeight;
-                setTimeout(typeChar, 16);
-            } else {
-                if (cursor) cursor.remove();
-                alexAgentBusy = false;
+        historyEl.appendChild(aEl);
+        const reader = res.body.getReader();
+        const dec = new TextDecoder();
+        let buf = '';
+        for (;;) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            buf += dec.decode(value, { stream: true });
+            let idx;
+            while ((idx = buf.indexOf('\n\n')) !== -1) {
+                const frame = buf.slice(0, idx);
+                buf = buf.slice(idx + 2);
+                const line = frame.split('\n').find((l) => l.startsWith('data: '));
+                if (!line) continue;
+                let ev;
+                try { ev = JSON.parse(line.slice(6)); } catch (e) { continue; }
+                if (ev.d) {
+                    reply += ev.d;
+                    answerSpan.textContent = reply;
+                    historyEl.scrollTop = historyEl.scrollHeight;
+                }
+                if (ev.error) {
+                    if (ev.error === 'rate_limited') failText = 'rate limited — give it a beat and try again.';
+                    throw new Error('upstream');
+                }
             }
-        };
-        typeChar();
-    }, 800);
+        }
+        if (!reply) throw new Error('empty');
+        alexChat.history.push({ role: 'assistant', content: reply });
+    } catch (err) {
+        loaderEl.remove();
+        if (!aEl.parentNode) historyEl.appendChild(aEl);
+        if (reply) {
+            // keep what was heard mid-stream
+            alexChat.history.push({ role: 'assistant', content: reply });
+        } else {
+            alexChat.history.pop(); // let the visitor retry cleanly
+            answerSpan.textContent = failText;
+        }
+    } finally {
+        const cursor = aEl.querySelector('.terminal-cursor');
+        if (cursor) cursor.remove();
+        historyEl.scrollTop = historyEl.scrollHeight;
+        chatUiBusy(false);
+    }
+}
 
-    history.scrollTop = history.scrollHeight;
+function openVoiceLink() {
+    const w = document.querySelector('alex-voice-widget');
+    if (w && typeof w.expand === 'function') w.expand();
 }
 
 // --- 6. Allow headings with underscores to wrap at underscores instead of mid-word ---
