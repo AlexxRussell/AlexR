@@ -178,6 +178,7 @@ export default async function handler(req, res) {
     }
 
     const filter = new ThinkFilter();
+    let started = false; // set once real (non-whitespace) text has been sent
     const decoder = new TextDecoder();
     let sseBuf = "";
 
@@ -207,13 +208,20 @@ export default async function handler(req, res) {
         }
         const delta = event?.choices?.[0]?.delta?.content;
         if (typeof delta === "string" && delta.length > 0) {
-          const visible = deDash(filter.push(delta));
+          let visible = deDash(filter.push(delta));
+          // The model leaves blank lines behind where its think block was;
+          // swallow all leading whitespace until real text starts.
+          if (!started && visible.length > 0) {
+            visible = visible.replace(/^\s+/, "");
+            if (visible.length > 0) started = true;
+          }
           if (visible.length > 0) sseWrite(res, { d: visible });
         }
       }
     }
 
-    const tail = deDash(filter.flush());
+    let tail = deDash(filter.flush());
+    if (!started) tail = tail.replace(/^\s+/, "");
     if (tail.length > 0) sseWrite(res, { d: tail });
     sseWrite(res, { done: true });
     res.end();

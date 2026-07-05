@@ -4,7 +4,8 @@
  * A single self-contained custom element (<alex-voice-widget>, Shadow DOM)
  * that replaces the old third-party embed. The pipeline:
  *
- *   mic → Web Speech API (STT) → POST /api/chat (SSE token stream)
+ *   mic → STT (Deepgram Nova-3 WS stream when /api/stt-token mints tokens;
+ *       Web Speech API as automatic fallback) → POST /api/chat (SSE stream)
  *       → sentence splitter → POST /api/tts (raw PCM s16le mono 24 kHz)
  *       → AudioWorklet ring-buffer player → speakers
  *
@@ -47,6 +48,15 @@ const BARGE_RMS = 0.08;         // sustained mic level that interrupts
 const BARGE_SUSTAIN_MS = 200;   // RMS must stay hot across ticks
 const TICK_MS = 120;            // housekeeping cadence (endpointing, barge RMS)
 
+// Deepgram streaming STT (primary engine when the server mints tokens).
+const STT_TOKEN_URL = '/api/stt-token';
+const DG_LISTEN_URL = 'wss://api.deepgram.com/v1/listen'
+    + '?model=nova-3&encoding=linear16&sample_rate=16000&channels=1'
+    + '&interim_results=true&endpointing=300&smart_format=true&punctuate=true';
+const DG_RATE = 16000;          // linear16 rate sent to Deepgram
+const DG_BATCH_MS = 100;        // mic audio batched into ~100 ms frames
+const DG_KEEPALIVE_MS = 8000;   // silence gap before a KeepAlive keeps the WS warm
+
 const REDUCED = window.matchMedia
     ? window.matchMedia('(prefers-reduced-motion: reduce)')
     : { matches: false };
@@ -62,6 +72,8 @@ const dbg = {
     sentencesQueued: 0, sentencesSpoken: 0,
     commits: 0, interrupts: 0, recognitionRestarts: 0,
     rateLimited: 0, errors: 0, utteranceId: 0,
+    sttEngine: null, dgConnects: 0, dgReconnects: 0,
+    dgFrames: 0, dgFinals: 0, dgInterims: 0,
 };
 window.__alexvoiceDebug = dbg;
 
@@ -122,6 +134,28 @@ const WORKLET_SOURCE = [
     'registerProcessor("alex-voice-player", AlexVoicePlayer);',
 ].join('\n');
 
+// ---------- AUDIOWORKLET CAPTURE (inlined, loaded via Blob URL) ----------
+// Mic tap for Deepgram streaming STT: each 128-frame Float32 render quantum
+// is converted to Int16 and posted to the main thread as a transferable.
+// It writes no output — it hangs off a zero-gain sink purely so the render
+// graph keeps pulling it.
+const CAPTURE_WORKLET_SOURCE = [
+    'class AlexVoiceCapture extends AudioWorkletProcessor {',
+    '  process(inputs) {',
+    '    const ch = inputs[0] && inputs[0][0];',
+    '    if (!ch || !ch.length) return true;',
+    '    const out = new Int16Array(ch.length);',
+    '    for (let i = 0; i < ch.length; i++) {',
+    '      const v = Math.max(-1, Math.min(1, ch[i]));',
+    '      out[i] = v < 0 ? v * 32768 : v * 32767;',
+    '    }',
+    '    this.port.postMessage({ type: "pcm", buf: out.buffer }, [out.buffer]);',
+    '    return true;',
+    '  }',
+    '}',
+    'registerProcessor("alex-voice-capture", AlexVoiceCapture);',
+].join('\n');
+
 // ---------- SMALL HELPERS ----------
 function wordCount(s) {
     return s.trim().split(/\s+/).filter(Boolean).length;
@@ -174,29 +208,27 @@ const WIDGET_CSS = `
         align-items: center;
         gap: 10px;
         padding: 10px 16px 10px 12px;
-        border: 1px solid rgba(0, 255, 0, 0.35);
+        border: 1px solid #0a0a0a;
         border-radius: 9999px;
-        background: rgba(6, 12, 20, 0.85);
-        color: #00ff41;
+        background: #f5f6f7;
+        color: #0a0a0a;
         font-size: 12px;
         font-weight: 700;
         letter-spacing: 0.14em;
-        box-shadow: 0 0 15px rgba(0, 255, 0, 0.2), 0 6px 20px rgba(0, 0, 0, 0.6);
+        box-shadow: 0 4px 16px rgba(0, 0, 0, 0.45);
         backdrop-filter: blur(6px);
         -webkit-backdrop-filter: blur(6px);
-        transition: transform 0.25s ease, box-shadow 0.25s ease, border-color 0.25s ease;
+        transition: transform 0.25s ease, box-shadow 0.25s ease;
     }
     .launcher:hover {
         transform: translateY(-2px);
-        border-color: #00ff41;
-        box-shadow: 0 0 25px rgba(0, 255, 0, 0.4), 0 8px 24px rgba(0, 0, 0, 0.7);
+        box-shadow: 0 8px 24px rgba(0, 0, 0, 0.55);
     }
     .launcher[hidden] { display: none; }
     .launcher .mini { width: 24px; height: 24px; display: block; }
     .launcher .dot {
         width: 7px; height: 7px; border-radius: 50%;
-        background: #00ff41;
-        box-shadow: 0 0 8px #00ff41;
+        background: #0a0a0a;
         animation: avw-pulse 2s infinite;
     }
 
@@ -559,6 +591,23 @@ class AlexVoiceWidget extends HTMLElement {
         this.interimEl = null;
         this.bargeHits = 0;
 
+        // STT engine selection — Deepgram streaming when the server mints
+        // tokens, Web Speech otherwise; the one flag switches every path.
+        this.sttEngine = null;          // 'deepgram' | 'webspeech' | null
+        this.dgWs = null;
+        this.dgCaptureNode = null;
+        this.dgMuteGain = null;
+        this.dgBatch = [];              // Int16 chunks (ctx rate) awaiting downsample
+        this.dgBatchSamples = 0;
+        this.dgFinalParts = [];         // is_final segments awaiting speech_final
+        this.dgLastAudioAt = 0;
+        this.dgKeepAliveTimer = 0;
+        this.dgReconnected = false;     // one mid-call reconnect, then fallback
+        this.sttGen = 0;                // bumped on every start/teardown: async
+                                        // work from a previous call generation
+                                        // must never touch the current one
+        this.captureWorkletReady = false;
+
         // Fetch controllers + TTS queue
         this.chatCtrl = null;
         this.ttsCtrl = null;
@@ -716,6 +765,7 @@ class AlexVoiceWidget extends HTMLElement {
         this.inputRow.hidden = false;
 
         // Audio unlock must start synchronously inside this click gesture.
+        this.applyAudioSession(withVoice);
         const audioOk = this.ensureContextSync();
 
         let voice = withVoice && !!SR_CTOR;
@@ -735,6 +785,7 @@ class AlexVoiceWidget extends HTMLElement {
         }
 
         this.voiceMode = voice;
+        this.applyAudioSession(voice); // mic may have been denied: reclassify
         dbg.mode = voice ? 'voice' : 'text';
         this.micBtn.hidden = !voice;
         this.callActive = true;
@@ -743,11 +794,19 @@ class AlexVoiceWidget extends HTMLElement {
         this.timerEl.hidden = !voice;
         this.timerEl.classList.remove('low');
         this.updateTimer();
-        if (voice) this.startRecognition();
+        // Engine pick is async (token fetch + WS handshake) and deliberately
+        // not awaited: the greeting must not wait on the network, and every
+        // failure inside falls back to Web Speech silently.
+        if (voice) this.startStt();
         this.startTick();
 
-        // Canned local greeting — no LLM round trip.
-        this.speakCanned(GREETING);
+        // Canned local greeting — no LLM round trip. Once per session:
+        // ending a call and starting another must not re-stack greetings
+        // in the persistent transcript.
+        if (!this.greeted) {
+            this.greeted = true;
+            this.speakCanned(GREETING);
+        }
         if (this.state === 'connecting') this.setState('listening');
         this.field.focus();
     }
@@ -761,6 +820,9 @@ class AlexVoiceWidget extends HTMLElement {
         this.stopTick();
         try { if (this.rec) this.rec.abort(); } catch (e) { /* ignore */ }
         this.recRunning = false;
+        this.stopDeepgram(true);        // before the mic teardown below
+        this.sttEngine = null;
+        dbg.sttEngine = null;
         this.clearInterim();
         if (this.micStream) {
             this.micStream.getTracks().forEach((t) => t.stop());
@@ -784,16 +846,33 @@ class AlexVoiceWidget extends HTMLElement {
     enterTextMode(noticeText) {
         if (!this.callActive || !this.voiceMode) return;
         this.voiceMode = false;
+        this.applyAudioSession(false); // pure playback: silent-switch immune
         dbg.mode = 'text';
         this.micBtn.hidden = true;
         try { if (this.rec) this.rec.abort(); } catch (e) { /* ignore */ }
         this.recRunning = false;
+        this.stopDeepgram(true);
+        this.sttEngine = null;
+        dbg.sttEngine = null;
         this.clearInterim();
         if (noticeText) this.sysMsg(noticeText);
         this.updateStateline();
     }
 
     // ================= AUDIO ENGINE =================
+
+    // iOS routes Web Audio through the ringer channel by default, so the
+    // agent is silent whenever the mute switch is on — visitors read that
+    // as "broken". The Audio Session API (Safari 16.4+) reclassifies us as
+    // media playback (or a call, when the mic is live), which ignores the
+    // silent switch and keeps output on the loudspeaker.
+    applyAudioSession(withMic) {
+        try {
+            if (navigator.audioSession) {
+                navigator.audioSession.type = withMic ? 'play-and-record' : 'playback';
+            }
+        } catch (e) { /* older browsers: no-op */ }
+    }
 
     ensureContextSync() {
         if (this.ctx) {
@@ -993,7 +1072,10 @@ class AlexVoiceWidget extends HTMLElement {
     // ================= STT (Web Speech) =================
 
     shouldListen() {
-        return this.callActive && this.voiceMode && !this.micMuted;
+        // Gates the Web Speech recognizer only — it must never run (or
+        // restart itself) while the Deepgram engine owns the mic.
+        return this.callActive && this.voiceMode && !this.micMuted
+            && this.sttEngine !== 'deepgram';
     }
 
     startRecognition() {
@@ -1145,6 +1227,7 @@ class AlexVoiceWidget extends HTMLElement {
 
     clearInterim() {
         this.interimText = '';
+        this.dgFinalParts.length = 0;   // dropping an interim drops its segments too
         if (this.interimEl) {
             this.interimEl.remove();
             this.interimEl = null;
@@ -1163,6 +1246,326 @@ class AlexVoiceWidget extends HTMLElement {
         } else {
             this.safeRecStart();
         }
+    }
+
+    // ================= STT (Deepgram streaming) =================
+    // Primary engine when /api/stt-token mints tokens: mic → capture worklet
+    // (Float32 → Int16) → ~100 ms batches downsampled to 16 kHz → WS to
+    // Deepgram Nova-3. Results feed the SAME interim/commit/barge-in paths
+    // as Web Speech. Any failure — no token (404), WS refusal, worklet
+    // unavailable, a second mid-call drop — falls back to Web Speech quietly.
+
+    async startStt() {
+        const gen = ++this.sttGen;      // this attempt owns the engine now
+        let ok = false;
+        try { ok = await this.startDeepgram(gen); } catch (e) { ok = false; }
+        if (gen !== this.sttGen) return; // an END/restart superseded us
+        if (!this.callActive || !this.voiceMode) return;
+        if (!ok) {
+            this.stopDeepgram(true);    // never leave both engines half-alive
+            this.sttEngine = 'webspeech';
+            dbg.sttEngine = 'webspeech';
+            this.startRecognition();
+        }
+    }
+
+    async fetchSttToken() {
+        const res = await fetch(STT_TOKEN_URL, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: '{}',
+        });
+        if (!res.ok) return null;       // 404 = not configured → silent fallback
+        const data = await res.json();
+        return (data && typeof data.token === 'string' && data.token) ? data.token : null;
+    }
+
+    async startDeepgram(gen) {
+        if (!this.ctx || !this.micSource || typeof WebSocket === 'undefined') return false;
+        this.sttEngine = 'deepgram';    // blocks the recognizer while we try
+        this.dgReconnected = false;
+        let token = null;
+        try { token = await this.fetchSttToken(); } catch (e) { /* fall back */ }
+        if (gen !== this.sttGen) return false;
+        if (!token || !this.callActive || !this.voiceMode) return false;
+        try { await this.ensureCaptureWorklet(); } catch (e) { /* fall back */ }
+        if (gen !== this.sttGen) return false;
+        if (!this.captureWorkletReady || !this.callActive || !this.voiceMode) return false;
+        try { await this.openDgSocket(token, gen); } catch (e) { return false; }
+        // Superseded after our socket opened: whoever bumped the generation
+        // (teardown or a newer attempt) has already closed or displaced our
+        // socket — never touch this.dgWs from a stale attempt.
+        if (gen !== this.sttGen) return false;
+        if (!this.callActive || !this.voiceMode) { this.stopDeepgram(true); return false; }
+        this.attachCapture();
+        dbg.sttEngine = 'deepgram';
+        return true;
+    }
+
+    // Same Blob-URL pattern as the player worklet; reuses the one shared
+    // AudioContext that the start-call gesture already unlocked (iOS).
+    async ensureCaptureWorklet() {
+        if (this.captureWorkletReady || !this.ctx || !this.ctx.audioWorklet) return;
+        const url = URL.createObjectURL(new Blob([CAPTURE_WORKLET_SOURCE], { type: 'application/javascript' }));
+        try {
+            await this.ctx.audioWorklet.addModule(url);
+        } finally {
+            URL.revokeObjectURL(url);
+        }
+        this.captureWorkletReady = true;
+    }
+
+    openDgSocket(token, gen) {
+        return new Promise((resolve, reject) => {
+            if (gen !== this.sttGen) {
+                reject(new Error('dg_stale'));
+                return;
+            }
+            let ws;
+            try {
+                // Browsers cannot set WS headers; Deepgram accepts the temp
+                // token via the Sec-WebSocket-Protocol pair instead. Grant
+                // JWTs use 'bearer' ('token' is only for raw API keys).
+                ws = new WebSocket(DG_LISTEN_URL, ['bearer', token]);
+            } catch (e) {
+                reject(e);
+                return;
+            }
+            ws.binaryType = 'arraybuffer';
+            let opened = false;
+            const stale = () => gen !== this.sttGen || this.dgWs !== ws;
+            ws.onopen = () => {
+                if (stale()) {                  // torn down / superseded while connecting
+                    try { ws.close(); } catch (e) { /* ignore */ }
+                    reject(new Error('dg_stale'));
+                    return;
+                }
+                opened = true;
+                dbg.dgConnects++;
+                this.dgLastAudioAt = performance.now();
+                this.startDgKeepAlive();
+                resolve();
+            };
+            ws.onmessage = (e) => {
+                if (!stale() && typeof e.data === 'string') this.onDgMessage(e.data);
+            };
+            ws.onerror = () => {
+                if (!opened) {
+                    if (this.dgWs === ws) this.dgWs = null;
+                    reject(new Error('dg_ws_error'));
+                }
+            };
+            ws.onclose = () => {
+                if (!opened) {
+                    if (this.dgWs === ws) this.dgWs = null;
+                    reject(new Error('dg_ws_closed'));
+                    return;
+                }
+                if (gen === this.sttGen && this.dgWs === ws) this.onDgClose();
+            };
+            // Never orphan a socket we displace (a stale attempt may have
+            // parked one here between our checks).
+            if (this.dgWs && this.dgWs !== ws) {
+                try { this.dgWs.close(); } catch (e) { /* ignore */ }
+            }
+            this.dgWs = ws;
+        });
+    }
+
+    attachCapture() {
+        if (this.dgCaptureNode || !this.ctx || !this.micSource) return;
+        const node = new AudioWorkletNode(this.ctx, 'alex-voice-capture', {
+            numberOfInputs: 1,
+            numberOfOutputs: 1,
+            outputChannelCount: [1],
+        });
+        node.port.onmessage = (e) => this.onCaptureChunk(e.data);
+        // Zero-gain sink keeps the node pulled by the render graph without
+        // ever being audible (its process() writes no output anyway).
+        const mute = this.ctx.createGain();
+        mute.gain.value = 0;
+        this.micSource.connect(node);
+        node.connect(mute);
+        mute.connect(this.ctx.destination);
+        this.dgCaptureNode = node;
+        this.dgMuteGain = mute;
+    }
+
+    onCaptureChunk(d) {
+        if (!d || d.type !== 'pcm' || !d.buf) return;
+        const ws = this.dgWs;
+        if (!ws || ws.readyState !== WebSocket.OPEN) return;
+        if (this.micMuted) {
+            // Mute contract: no audio leaves the page; KeepAlive holds the WS.
+            this.dgBatch.length = 0;
+            this.dgBatchSamples = 0;
+            return;
+        }
+        const chunk = new Int16Array(d.buf);
+        this.dgBatch.push(chunk);
+        this.dgBatchSamples += chunk.length;
+        if (this.dgBatchSamples < Math.floor(this.outputSampleRate() * DG_BATCH_MS / 1000)) return;
+        const joined = new Int16Array(this.dgBatchSamples);
+        let off = 0;
+        for (const c of this.dgBatch) { joined.set(c, off); off += c.length; }
+        this.dgBatch.length = 0;
+        this.dgBatchSamples = 0;
+        const frame = this.downsampleForDg(joined);
+        try { ws.send(frame.buffer); } catch (e) { return; }
+        dbg.dgFrames++;
+        this.dgLastAudioAt = performance.now();
+    }
+
+    // Linear-interp downsample from the shared context rate (24 kHz — or the
+    // device rate when the context refused 24 kHz) to Deepgram's 16 kHz.
+    downsampleForDg(pcm) {
+        const inRate = this.outputSampleRate();
+        if (inRate === DG_RATE) return pcm;
+        const ratio = inRate / DG_RATE;
+        const n = Math.max(1, Math.floor(pcm.length / ratio));
+        const out = new Int16Array(n);
+        for (let i = 0; i < n; i++) {
+            const p = i * ratio;
+            const j = Math.floor(p);
+            const fr = p - j;
+            const a = pcm[j] !== undefined ? pcm[j] : 0;
+            const b = pcm[j + 1] !== undefined ? pcm[j + 1] : a;
+            out[i] = Math.round(a + (b - a) * fr);
+        }
+        return out;
+    }
+
+    startDgKeepAlive() {
+        this.stopDgKeepAlive();
+        this.dgKeepAliveTimer = setInterval(() => {
+            const ws = this.dgWs;
+            if (!ws || ws.readyState !== WebSocket.OPEN) return;
+            if (performance.now() - this.dgLastAudioAt < DG_KEEPALIVE_MS) return;
+            try { ws.send(JSON.stringify({ type: 'KeepAlive' })); } catch (e) { /* ignore */ }
+            this.dgLastAudioAt = performance.now();
+        }, 2000);
+    }
+
+    stopDgKeepAlive() {
+        if (this.dgKeepAliveTimer) {
+            clearInterval(this.dgKeepAliveTimer);
+            this.dgKeepAliveTimer = 0;
+        }
+    }
+
+    // Deepgram Results events, routed onto the exact paths the Web Speech
+    // handler uses: interims → setInterim + maybeBargeIn (echo-gated),
+    // finals → dropped while agent audio is active, committed on endpoint.
+    // is_final closes a segment; speech_final marks the utterance endpoint,
+    // so segments accumulate in dgFinalParts until then.
+    onDgMessage(raw) {
+        let data;
+        try { data = JSON.parse(raw); } catch (e) { return; }
+        if (!data || data.type !== 'Results') return;
+        const alt = data.channel && data.channel.alternatives && data.channel.alternatives[0];
+        const text = (alt && typeof alt.transcript === 'string') ? alt.transcript.trim() : '';
+        const hearingAgent = this.agentAudioActive();
+
+        if (data.is_final) {
+            if (text) dbg.dgFinals++;
+            if (hearingAgent) {
+                this.clearInterim();    // same echo rule as Web Speech finals
+                return;
+            }
+            if (text) this.dgFinalParts.push(text);
+            const full = this.dgFinalParts.join(' ').trim();
+            if (data.speech_final) {
+                this.dgFinalParts.length = 0;
+                this.clearInterim();
+                if (full) this.commitUtterance(full);
+            } else if (full) {
+                this.setInterim(full);  // segment done, utterance continuing
+            }
+            return;
+        }
+
+        if (!text) return;
+        dbg.dgInterims++;
+        const shown = this.dgFinalParts.length
+            ? this.dgFinalParts.join(' ') + ' ' + text
+            : text;
+        if (!hearingAgent || !this.isLikelySelfEcho(shown)) this.setInterim(shown);
+        else this.clearInterim();
+        if (hearingAgent) this.maybeBargeIn(shown);
+    }
+
+    onDgClose() {
+        // Reached only on an unexpected close — deliberate teardown paths
+        // null out dgWs before closing the socket.
+        this.stopDgKeepAlive();
+        this.dgWs = null;
+        if (!this.callActive || !this.voiceMode || this.sttEngine !== 'deepgram') return;
+        if (this.dgReconnected) {
+            this.dgFallback();
+            return;
+        }
+        this.dgReconnected = true;
+        dbg.dgReconnects++;
+        this.reconnectDeepgram(this.sttGen);
+    }
+
+    async reconnectDeepgram(gen) {
+        let ok = false;
+        try {
+            const token = await this.fetchSttToken();
+            if (gen === this.sttGen && token && this.callActive && this.sttEngine === 'deepgram') {
+                await this.openDgSocket(token, gen);
+                ok = true;
+            }
+        } catch (e) { /* fall back below */ }
+        if (gen !== this.sttGen) return; // superseded: not ours to act on
+        if (!this.callActive || !this.voiceMode || this.sttEngine !== 'deepgram') return;
+        if (!ok) this.dgFallback();
+    }
+
+    dgFallback() {
+        // Deepgram died twice mid-call: switch to Web Speech, quietly —
+        // typed input always works, so no user-facing error.
+        dbg.errors++;
+        this.stopDeepgram(false);
+        if (!this.callActive || !this.voiceMode) return;
+        if (SR_CTOR) {
+            this.sttEngine = 'webspeech';
+            dbg.sttEngine = 'webspeech';
+            this.startRecognition();
+        } else {
+            this.sttEngine = null;
+            dbg.sttEngine = null;
+            this.enterTextMode('voice input hiccuped — text mode enabled; replies are still spoken.');
+        }
+    }
+
+    stopDeepgram(graceful) {
+        this.sttGen++;                  // invalidate any in-flight async work
+        this.stopDgKeepAlive();
+        const ws = this.dgWs;
+        this.dgWs = null;               // onclose now reads as deliberate
+        if (ws) {
+            try {
+                if (graceful && ws.readyState === WebSocket.OPEN) {
+                    ws.send(JSON.stringify({ type: 'CloseStream' }));
+                }
+            } catch (e) { /* ignore */ }
+            try { ws.close(); } catch (e) { /* ignore */ }
+        }
+        if (this.dgCaptureNode) {
+            this.dgCaptureNode.port.onmessage = null;
+            try { if (this.micSource) this.micSource.disconnect(this.dgCaptureNode); } catch (e) { /* ignore */ }
+            try { this.dgCaptureNode.disconnect(); } catch (e) { /* ignore */ }
+            this.dgCaptureNode = null;
+        }
+        if (this.dgMuteGain) {
+            try { this.dgMuteGain.disconnect(); } catch (e) { /* ignore */ }
+            this.dgMuteGain = null;
+        }
+        this.dgBatch.length = 0;
+        this.dgBatchSamples = 0;
+        this.dgFinalParts.length = 0;
     }
 
     // ================= CONVERSATION LOOP =================
@@ -1806,7 +2209,7 @@ class AlexVoiceWidget extends HTMLElement {
         const n = 4, barW = 3, gap = 2;
         const total = n * barW + (n - 1) * gap;
         const x0 = (24 - total) / 2;
-        c.fillStyle = 'rgba(0,255,65,0.9)';
+        c.fillStyle = 'rgba(10,10,10,0.92)';
         for (let i = 0; i < n; i++) {
             const breath = REDUCED.matches ? 0.5 : 0.5 + 0.5 * Math.sin(ts / 700 + i * 0.9);
             const h = 5 + 9 * breath * (i === 1 || i === 2 ? 1 : 0.65);
