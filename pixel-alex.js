@@ -215,6 +215,36 @@
       "......kWWkkWWk......",
       "....................",
     ],
+    // star jump: both arms flung up and out in a Y, legs spread mid-air —
+    // one of the two celebration hops a click can earn
+    cheerY: [
+      "....................",
+      "......kkkkkkkk......",
+      ".ks..khhHHHHhhk..sk.",
+      ".ksk.khHhhhhhhk.ksk.",
+      "..kGkkhhhhhhhhkkGk..",
+      "..kGkkhsssssshkkGk..",
+      "...kGkssessesskGk...",
+      "...kGkSssssssSkGk...",
+      "....kGksssssskGk....",
+      "........kssk........",
+      "......kggggggk......",
+      ".....kGggggggGk.....",
+      ".....kGggzzggGk.....",
+      ".....kGggzzggGk.....",
+      ".....kGggzzggGk.....",
+      ".....kGggzzggGk.....",
+      ".....kGGGzzGGGk.....",
+      "......kGGGGGGk......",
+      ".....kddk..kddk.....",
+      ".....kddk..kddk.....",
+      "....kDdk....kdDk....",
+      "....kDdk....kdDk....",
+      "....kddk....kddk....",
+      "....kwwk....kwwk....",
+      "....kWWk....kWWk....",
+      "....................",
+    ],
     // presenting: arm extended toward the content he is highlighting
     pointA: [
       "....................",
@@ -648,7 +678,7 @@
   // eye row per front-facing frame (eyes sit at x=8 and x=11 in both
   // the right and mirrored bake, the faces being symmetric); used by
   // the cursor-gaze overlay in render()
-  var EYE_ROW = { idleA: 6, idleB: 7, waveA: 6, waveB: 6, pointA: 6, pointB: 6, sit: 10, duckA: 13, duckB: 14 };
+  var EYE_ROW = { idleA: 6, idleB: 7, waveA: 6, waveB: 6, pointA: 6, pointB: 6, sit: 10, duckA: 13, duckB: 14, cheerY: 6 };
 
   /* ------------------------------------------------------------------ *
    * 2. STAGE
@@ -725,6 +755,35 @@
     { passive: true }
   );
 
+  // the old-arcade score chime: two short square-wave blips, like the
+  // Chrome dino clearing a hundred points. Lazy context, created inside
+  // the click gesture; quiet enough to charm rather than startle.
+  var pingCtx = null;
+  function playPing() {
+    try {
+      var AC = window.AudioContext || window.webkitAudioContext;
+      if (!AC) return;
+      if (!pingCtx) pingCtx = new AC();
+      if (pingCtx.state === "suspended") pingCtx.resume();
+      var t0 = pingCtx.currentTime;
+      [988, 1319].forEach(function (freq, i) {
+        var osc = pingCtx.createOscillator();
+        var g = pingCtx.createGain();
+        osc.type = "square";
+        osc.frequency.value = freq;
+        var at = t0 + i * 0.09;
+        g.gain.setValueAtTime(0.035, at);
+        g.gain.exponentialRampToValueAtTime(0.001, at + 0.08);
+        osc.connect(g);
+        g.connect(pingCtx.destination);
+        osc.start(at);
+        osc.stop(at + 0.09);
+      });
+    } catch (err) {
+      /* audio is a garnish; never let it break the click */
+    }
+  }
+
   document.addEventListener(
     "click",
     function (e) {
@@ -753,6 +812,10 @@
       alex.dir = cx >= alex.x ? 1 : -1;
       alex.hops = 1;
       alex.vy = -380;
+      // half the time he throws his arms out in a star jump, and every
+      // poke earns the visitor an arcade point-chime
+      alex.cheerStyle = Math.random() < 0.5 ? "Y" : "";
+      playPing();
       setState("cheer");
       for (var i = 0; i < 3; i++) {
         alex.dust.push({
@@ -2257,7 +2320,9 @@
       case "present":
         return Math.floor(t / 0.35) % 2 ? "pointB" : "pointA";
       case "cheer":
-        return alex.vy < -40 || alex.y < (alex.platform ? alex.platform.y - 2 : alex.y) ? "jump" : "idleA";
+        return alex.vy < -40 || alex.y < (alex.platform ? alex.platform.y - 2 : alex.y)
+          ? (alex.cheerStyle === "Y" ? "cheerY" : "jump")
+          : "idleA";
       case "run":
         return ["runA", "runB", "runC", "runD"][Math.floor(t / 0.09) % 4];
       case "jump":
