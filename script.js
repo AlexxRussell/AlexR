@@ -234,6 +234,42 @@ function sendChatForm(ev) {
     return false;
 }
 
+// Smooth streaming: the model delivers text in uneven lumps, so network
+// chunks land in a buffer and this typer drains it at a steady, readable
+// pace, accelerating when it falls behind so it never lags the stream.
+function createTyper(span, historyEl) {
+    let buf = '';
+    let out = '';
+    let done = false;
+    let onDrained = null;
+    const timer = setInterval(() => {
+        if (buf.length) {
+            const n = Math.max(1, Math.min(12, Math.round(buf.length / 50)));
+            out += buf.slice(0, n);
+            buf = buf.slice(n);
+            span.textContent = out;
+            historyEl.scrollTop = historyEl.scrollHeight;
+        } else if (done) {
+            clearInterval(timer);
+            if (onDrained) onDrained();
+        }
+    }, 24);
+    return {
+        push(text) { buf += text; },
+        finish() {
+            return new Promise((resolve) => {
+                done = true;
+                onDrained = resolve;
+                if (!buf.length) { clearInterval(timer); resolve(); }
+            });
+        },
+        cancel(finalText) {
+            clearInterval(timer);
+            span.textContent = finalText !== undefined ? finalText : out + buf;
+        },
+    };
+}
+
 async function askAlex(question) {
     if (alexChat.busy) return;
     question = String(question || '').trim().slice(0, 500);
@@ -262,6 +298,7 @@ async function askAlex(question) {
 
     alexChat.history.push({ role: 'user', content: question });
     let reply = '';
+    let typer = null;
     let failText = 'link hiccup, try again in a moment.';
     try {
         const res = await fetch('/api/chat', {
@@ -275,6 +312,7 @@ async function askAlex(question) {
         }
         loaderEl.remove();
         historyEl.appendChild(aEl);
+        typer = createTyper(answerSpan, historyEl);
         const reader = res.body.getReader();
         const dec = new TextDecoder();
         let buf = '';
@@ -292,8 +330,7 @@ async function askAlex(question) {
                 try { ev = JSON.parse(line.slice(6)); } catch (e) { continue; }
                 if (ev.d) {
                     reply += ev.d;
-                    answerSpan.textContent = reply;
-                    historyEl.scrollTop = historyEl.scrollHeight;
+                    typer.push(ev.d);
                 }
                 if (ev.error) {
                     if (ev.error === 'rate_limited') failText = 'rate limited, give it a beat and try again.';
@@ -302,14 +339,17 @@ async function askAlex(question) {
             }
         }
         if (!reply) throw new Error('empty');
+        await typer.finish(); // let the last characters land before unlocking
         alexChat.history.push({ role: 'assistant', content: reply });
     } catch (err) {
         loaderEl.remove();
         if (!aEl.parentNode) historyEl.appendChild(aEl);
         if (reply) {
-            // keep what was heard mid-stream
+            // keep what was heard mid-stream, shown in full
+            if (typer) typer.cancel();
             alexChat.history.push({ role: 'assistant', content: reply });
         } else {
+            if (typer) typer.cancel('');
             alexChat.history.pop(); // let the visitor retry cleanly
             answerSpan.textContent = failText;
         }
