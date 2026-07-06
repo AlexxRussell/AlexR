@@ -54,9 +54,9 @@ Python, n8n workflows, VBA / Macros, Git / GitHub, Linux
 ## Education
 
 ### B.Sc Computer Science and Information Systems, University of Canterbury (Jul 2023 to Jun 2026)
-- A-Grade average with 50% course overload
+- A or A+ in every graded course across the final 18 months (GPA 8.7/9.0), with a straight-A+ final year (9.0/9.0)
 - Selected for Deloitte x ServiceNow AI Hackathon (2025)
-- Key grades: Artificial Intelligence (A+), Web Architectures (A+), Relational Databases (A), Business Intelligence (A)
+- Key grades: Artificial Intelligence (A+), Algorithms (A+), Big Data Computing (A+), Web Architectures (A+), Relational Databases (A), Business Intelligence (A)
 
 ### National Senior Certificate, Windhoek Afrikaans Private School (Dec 2021)
 - 7 Distinctions (Straight A's)
