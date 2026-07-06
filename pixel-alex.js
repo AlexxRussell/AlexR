@@ -801,6 +801,7 @@
       ) {
         return;
       }
+      if (perch && alex.platform === perch) return; // seated on the widget: leave him be
       var cx = e.clientX + scrollX;
       var cy = e.clientY + scrollY;
       var r = canvas.getBoundingClientRect();
@@ -813,9 +814,10 @@
       alex.hops = 1;
       alex.vy = -380;
       // half the time he throws his arms out in a star jump, and every
-      // poke earns the visitor an arcade point-chime
+      // poke earns the visitor an arcade point-chime — unless the voice
+      // agent has a call up: its audio owns the stage then
       alex.cheerStyle = Math.random() < 0.5 ? "Y" : "";
-      playPing();
+      if (voiceState === "idle") playPing();
       setState("cheer");
       for (var i = 0; i < 3; i++) {
         alex.dust.push({
@@ -1238,7 +1240,8 @@
       if (!dup) platforms.push(p);
     }
     // keep his references pointing at live objects after a rebuild
-    if (alex.platform) alex.platform = remap(alex.platform);
+    // (the widget perch is synthetic and never in the platform list)
+    if (alex.platform && alex.platform.kind !== "widget") alex.platform = remap(alex.platform);
     if (alex.target) alex.target = remap(alex.target);
     if (alex.afterBlip) alex.afterBlip = remap(alex.afterBlip);
     if (alex.anchor) alex.anchor = remap(alex.anchor);
@@ -2451,6 +2454,7 @@
     touchAttend(ts); // touch analogue of hover attention (no-op with a mouse)
     navTick(); // does the sticky header overlap him this frame?
     step(dt);
+    widgetPerchTick(); // after physics: the pin to the fixed card wins the frame
 
     // render throttle: deep idle (nothing moving, nobody interacting)
     // paints at ~12fps instead of 60 — breathing still reads fine
@@ -2654,6 +2658,84 @@
       setState("cheer");
     }
   });
+
+  /* ------------------------------------------------------------------
+   * 12b. THE WIDGET PERCH — the voice widget card is position:fixed and
+   * floats above everything (z-index 9999 vs his 45), so standing
+   * behind it means vanishing. When the open card would cover him, he
+   * climbs on top and sits on its edge instead — and because the ledge
+   * is re-pinned every frame, he rides the card while the visitor
+   * scrolls. When the card closes he simply drops back into the page
+   * and the normal landing rules catch him.
+   * ------------------------------------------------------------------ */
+  var perch = null; // synthetic ledge glued to the card; never in platforms[]
+
+  function widgetCardRect() {
+    var host = document.querySelector("alex-voice-widget");
+    if (!host || !host.shadowRoot) return null;
+    var card = host.shadowRoot.querySelector(".card");
+    if (!card || card.hidden) return null;
+    var r = card.getBoundingClientRect();
+    if (r.width < 40 || r.height < 40) return null;
+    return r;
+  }
+
+  function pinPerch(r) {
+    perch.x1 = r.left + scrollX;
+    perch.x2 = r.right + scrollX;
+    perch.y = r.top + scrollY + 1;
+    perch.iv = [[perch.x1 + 10, perch.x2 - 10]];
+    perch.stand = perch.iv;
+    alex.platform = perch;
+    alex.target = null;
+    alex.jumpFrom = null;
+    alex.passThroughTarget = null;
+    alex.vx = 0;
+    alex.vy = 0;
+    alex.x = Math.min(Math.max(alex.x, perch.x1 + 16), perch.x2 - 16);
+    alex.y = perch.y;
+    alex.sitUntil = clock + 0.5; // refreshed every frame: he stays seated
+    if (alex.state !== "sit") setState("sit");
+  }
+
+  function widgetPerchTick() {
+    if (!enabled) return;
+    var r = widgetCardRect();
+    if (perch) {
+      if (!r) {
+        // card closed: back into the world, gravity does the rest
+        perch = null;
+        if (alex.platform && alex.platform.kind === "widget") {
+          alex.platform = null;
+          alex.vy = 0;
+          setState("fall");
+        }
+        return;
+      }
+      pinPerch(r);
+      return;
+    }
+    if (!r) return;
+    // only whisk him up from settled ground states; a jump arc that
+    // passes behind the card is a blink, not a burial
+    var grounded =
+      alex.state === "idle" ||
+      alex.state === "run" ||
+      alex.state === "wave" ||
+      alex.state === "sit" ||
+      alex.state === "present" ||
+      alex.state === "inspect" ||
+      alex.state === "land";
+    if (!grounded) return;
+    var x1 = r.left + scrollX - 4;
+    var x2 = r.right + scrollX + 4;
+    var y1 = r.top + scrollY - 4;
+    var y2 = r.bottom + scrollY + 4;
+    var covered = alex.x > x1 && alex.x < x2 && alex.y > y1 && alex.y - CH < y2;
+    if (!covered) return;
+    perch = { el: null, kind: "widget", x1: 0, x2: 0, y: 0, iv: [], duck: [], stand: [] };
+    pinPerch(r);
+  }
 
   function boot() {
     // the easter egg always installs — even under prefers-reduced-motion,

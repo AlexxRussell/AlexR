@@ -645,6 +645,8 @@ class AlexVoiceWidget extends HTMLElement {
         this.lastRingAt = 0;
         this.noticeText = '';
         this.noticeUntil = 0;
+        this.wakeLock = null;           // screen wake lock held during a call
+        this.wakeLockPending = false;   // a request() is in flight
         this.tickTimer = 0;
 
         const root = this.attachShadow({ mode: 'open' });
@@ -701,6 +703,8 @@ class AlexVoiceWidget extends HTMLElement {
             if (!document.hidden) {
                 this.resumeAudio();
                 this.startLoop();
+                // The OS drops the wake lock while the tab is hidden.
+                if (this.callActive) this.acquireWakeLock();
             }
         });
         window.addEventListener('pointerdown', () => this.resumeAudio(), { passive: true });
@@ -814,6 +818,7 @@ class AlexVoiceWidget extends HTMLElement {
         dbg.mode = voice ? 'voice' : 'text';
         this.micBtn.hidden = !voice;
         this.callActive = true;
+        this.acquireWakeLock();
         // voice calls are capped: the countdown keeps it fair and visible
         this.callDeadline = voice ? performance.now() + CALL_MAX_MS : 0;
         this.timerEl.hidden = !voice;
@@ -842,6 +847,7 @@ class AlexVoiceWidget extends HTMLElement {
         if (this.turn) this.interrupt('end');
         this.callActive = false;
         this.callDeadline = 0;
+        this.releaseWakeLock();
         this.timerEl.hidden = true;
         this.stopTick();
         try { if (this.rec) this.rec.abort(); } catch (e) { /* ignore */ }
@@ -868,6 +874,38 @@ class AlexVoiceWidget extends HTMLElement {
         this.inputRow.hidden = true;
         this.startPanel.hidden = false;
         this.setState('idle');
+    }
+
+    // Screen wake lock: a call is a hands-off experience (especially voice),
+    // so the phone must not sleep mid-conversation. The OS releases the lock
+    // whenever the tab hides; the visibilitychange handler re-acquires it.
+    // Unsupported browsers simply keep their normal sleep behavior.
+    async acquireWakeLock() {
+        if (!('wakeLock' in navigator) || this.wakeLock || this.wakeLockPending) return;
+        this.wakeLockPending = true;
+        try {
+            const lock = await navigator.wakeLock.request('screen');
+            if (!this.callActive || this.wakeLock) {
+                // Call ended while we awaited, or another lock won the race.
+                try { lock.release(); } catch (e) { /* ignore */ }
+                return;
+            }
+            this.wakeLock = lock;
+            lock.addEventListener('release', () => {
+                if (this.wakeLock === lock) this.wakeLock = null;
+            });
+        } catch (e) {
+            /* denied (low battery etc.): screen may sleep */
+        } finally {
+            this.wakeLockPending = false;
+        }
+    }
+
+    releaseWakeLock() {
+        if (this.wakeLock) {
+            try { this.wakeLock.release(); } catch (e) { /* ignore */ }
+            this.wakeLock = null;
+        }
     }
 
     enterTextMode(noticeText) {
@@ -2261,6 +2299,30 @@ class AlexVoiceWidget extends HTMLElement {
                 c.fillStyle = 'rgba(' + r + ',' + g + ',' + b + ',0.85)';
                 c.fill();
             }
+        }
+
+        // Processing ring while thinking: two thin arcs sweeping around the
+        // orb — unmistakable "working on it" motion even at a glance, without
+        // leaving the terminal aesthetic. (Dots alone read as ambient.)
+        if (this.state === 'thinking') {
+            // level is smoothed across states (can be ~1 right after loud
+            // speech), so clamp the ring inside the canvas.
+            const pR = Math.min(R * 1.62, S * 0.47);
+            const sweep = 1.15;
+            const base = t * 1.8;
+            c.save();
+            c.lineWidth = 2;
+            c.lineCap = 'round';
+            c.shadowColor = 'rgba(' + r + ',' + g + ',' + b + ',0.7)';
+            c.shadowBlur = 6;
+            c.strokeStyle = 'rgba(' + r + ',' + g + ',' + b + ',0.55)';
+            for (let i = 0; i < 2; i++) {
+                const a0 = base + i * Math.PI;
+                c.beginPath();
+                c.arc(cx, cy, pR, a0, a0 + sweep);
+                c.stroke();
+            }
+            c.restore();
         }
     }
 
