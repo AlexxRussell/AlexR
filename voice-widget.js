@@ -647,6 +647,7 @@ class AlexVoiceWidget extends HTMLElement {
         this.noticeUntil = 0;
         this.wakeLock = null;           // screen wake lock held during a call
         this.wakeLockPending = false;   // a request() is in flight
+        this.callGen = 0;               // bumped on teardown: cancels in-flight startCall
         this.tickTimer = 0;
 
         const root = this.attachShadow({ mode: 'open' });
@@ -785,6 +786,7 @@ class AlexVoiceWidget extends HTMLElement {
 
     async startCall(withVoice) {
         if (this.callActive) return;
+        const gen = ++this.callGen;
         dbg.calls++;
         this.setState('connecting');
         this.startPanel.hidden = true;
@@ -811,6 +813,25 @@ class AlexVoiceWidget extends HTMLElement {
         }
         if (audioOk) {
             try { await this.ensureWorklet(); } catch (e) { dbg.errors++; }
+        }
+
+        // The awaits above (mic permission, worklet) can outlive the card:
+        // if it was collapsed meanwhile, endCall() no-opped (callActive was
+        // still false), so abort here instead of starting a hidden call.
+        if (gen !== this.callGen || this.card.hidden) {
+            if (this.micStream) {
+                this.micStream.getTracks().forEach((t) => t.stop());
+                this.micStream = null;
+            }
+            if (this.micSource) {
+                try { this.micSource.disconnect(); } catch (e) { /* ignore */ }
+                this.micSource = null;
+                this.micAnalyser = null;
+            }
+            this.inputRow.hidden = true;
+            this.startPanel.hidden = false;
+            this.setState('idle');
+            return;
         }
 
         this.voiceMode = voice;
@@ -843,6 +864,7 @@ class AlexVoiceWidget extends HTMLElement {
     }
 
     endCall() {
+        this.callGen++;     // cancels any startCall still awaiting setup
         if (!this.callActive) return;
         if (this.turn) this.interrupt('end');
         this.callActive = false;
