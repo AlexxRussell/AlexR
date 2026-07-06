@@ -40,9 +40,17 @@ const HISTORY_MAX = 14;         // messages kept client-side
 const MSG_MAX = 1200;           // chars per message (server contract)
 const TTS_MAX = 800;            // chars per TTS request (server contract)
 const GREETING = "Hey, I'm Alexander's AI. Ask me anything about his work.";
+// Spoken turns never show the raw STT words (mishears would read as
+// glitches); the transcript shows placeholders while the LLM gets the text.
+const VOICE_MSG_LABEL = 'Voice message';
+const VOICE_INTERIM_LABEL = 'Listening…';
 const CALL_MAX_MS = 120_000;    // voice calls end themselves after two minutes
 const CALL_WARN_MS = 15_000;    // countdown turns amber for the final stretch
-const ENDPOINT_MS = 900;        // stable interim + this much silence → commit
+const CALL_RED_MS = 10_000;     // countdown turns red and pulses; stateline warns once
+const ENDPOINT_MS = 900;        // Web Speech: stable interim + this much silence → commit
+const DG_ENDPOINT_MS = 300;     // Deepgram endpointing: silence before speech_final ends a turn
+const DG_FALLBACK_MS = 1800;    // tick safety net when Deepgram never sends speech_final
+const STALE_FINAL_MS = 3000;    // engine finals matching a tick()-committed utterance are dupes this long
 const BARGE_MIN_WORDS = 2;      // interim words that interrupt the agent
 const BARGE_RMS = 0.08;         // sustained mic level that interrupts
 const BARGE_SUSTAIN_MS = 200;   // RMS must stay hot across ticks
@@ -52,7 +60,8 @@ const TICK_MS = 120;            // housekeeping cadence (endpointing, barge RMS)
 const STT_TOKEN_URL = '/api/stt-token';
 const DG_LISTEN_URL = 'wss://api.deepgram.com/v1/listen'
     + '?model=nova-3&encoding=linear16&sample_rate=16000&channels=1'
-    + '&interim_results=true&endpointing=300&smart_format=true&punctuate=true';
+    + '&interim_results=true&endpointing=' + DG_ENDPOINT_MS
+    + '&smart_format=true&punctuate=true';
 const DG_RATE = 16000;          // linear16 rate sent to Deepgram
 const DG_BATCH_MS = 100;        // mic audio batched into ~100 ms frames
 const DG_KEEPALIVE_MS = 8000;   // silence gap before a KeepAlive keeps the WS warm
@@ -255,6 +264,10 @@ const WIDGET_CSS = `
         overflow: hidden;
     }
     .card[hidden] { display: none; }
+    /* Start screen (idle = no active call): the previous session's chat
+       stays out of the way and the card shrinks to orb + start panel. */
+    .card[data-state="idle"] { height: auto; }
+    .card[data-state="idle"] .transcript { display: none; }
     .card::after {  /* faint scanlines, matching the site's terminal vibe */
         content: '';
         position: absolute;
@@ -288,6 +301,11 @@ const WIDGET_CSS = `
         font-variant-numeric: tabular-nums;
     }
     .timer.low { color: #ffb020; border-color: rgba(255, 176, 32, 0.45); }
+    .timer.red {
+        color: #ff5a5a;
+        border-color: rgba(255, 90, 90, 0.55);
+        animation: avw-pulse 1.2s infinite;
+    }
     .title .dim { color: #5a6a5f; font-weight: 400; }
     .btn-min {
         border: 1px solid rgba(255, 255, 255, 0.15);
@@ -402,6 +420,7 @@ const WIDGET_CSS = `
         color: #c9d2cc;
     }
     .m.agent.cut { border-style: dashed; opacity: 0.75; }
+    .m.user.voice { opacity: 0.7; font-style: italic; }
     .m.interim { opacity: 0.45; font-style: italic; }
     .m.sys {
         max-width: 100%;
@@ -601,6 +620,8 @@ class AlexVoiceWidget extends HTMLElement {
         this.dgBatch = [];              // Int16 chunks (ctx rate) awaiting downsample
         this.dgBatchSamples = 0;
         this.dgFinalParts = [];         // is_final segments awaiting speech_final
+        this.staleFinalText = '';       // tick() committed ahead of the engine:
+        this.staleFinalUntil = 0;       // matching finals are dupes until then
         this.dgLastAudioAt = 0;
         this.dgKeepAliveTimer = 0;
         this.dgReconnected = false;     // one mid-call reconnect, then fallback
@@ -764,6 +785,9 @@ class AlexVoiceWidget extends HTMLElement {
         this.setState('connecting');
         this.startPanel.hidden = true;
         this.inputRow.hidden = false;
+        // The transcript was display:none on the start screen, which zeroes
+        // its scroll position; re-pin it to the latest messages.
+        this.scrollTranscript();
 
         // Audio unlock must start synchronously inside this click gesture.
         this.applyAudioSession(withVoice);
@@ -793,7 +817,8 @@ class AlexVoiceWidget extends HTMLElement {
         // voice calls are capped: the countdown keeps it fair and visible
         this.callDeadline = voice ? performance.now() + CALL_MAX_MS : 0;
         this.timerEl.hidden = !voice;
-        this.timerEl.classList.remove('low');
+        this.timerEl.classList.remove('low', 'red');
+        this.timeNoticeShown = false;
         this.updateTimer();
         // Engine pick is async (token fetch + WS handshake) and deliberately
         // not awaited: the greeting must not wait on the network, and every
@@ -825,6 +850,7 @@ class AlexVoiceWidget extends HTMLElement {
         this.sttEngine = null;
         dbg.sttEngine = null;
         this.clearInterim();
+        this.clearStaleFinalGuard();
         if (this.micStream) {
             this.micStream.getTracks().forEach((t) => t.stop());
             this.micStream = null;
@@ -1204,11 +1230,15 @@ class AlexVoiceWidget extends HTMLElement {
         }
         const finalText = finals.trim();
         if (finalText) {
+            if (this.isStaleFinal(finalText)) {
+                this.clearStaleFinalGuard();
+                return;
+            }
             if (hearingAgentAtStart || this.agentAudioActive()) {
                 this.clearInterim();
                 return;
             }
-            this.commitUtterance(finalText);
+            this.commitUtterance(finalText, true);
         }
     }
 
@@ -1222,7 +1252,7 @@ class AlexVoiceWidget extends HTMLElement {
             this.interimEl.className = 'm user interim';
             this.transcriptEl.appendChild(this.interimEl);
         }
-        this.interimEl.textContent = text;
+        this.interimEl.textContent = VOICE_INTERIM_LABEL;
         this.scrollTranscript();
     }
 
@@ -1233,6 +1263,40 @@ class AlexVoiceWidget extends HTMLElement {
             this.interimEl.remove();
             this.interimEl = null;
         }
+    }
+
+    // Stale-final guard: when tick() commits an utterance the engine never
+    // endpointed, the engine's own final for that audio may still arrive and
+    // must not commit again. Matching on text within a short window (rather
+    // than a bare flag) means a real new utterance is never eaten — even a
+    // Web Speech final that arrives with no preceding interim.
+    armStaleFinalGuard(text) {
+        this.staleFinalText = normalizedWords(text).join(' ');
+        this.staleFinalUntil = performance.now() + STALE_FINAL_MS;
+    }
+
+    clearStaleFinalGuard() {
+        this.staleFinalText = '';
+        this.staleFinalUntil = 0;
+    }
+
+    // A late final may be the whole utterance re-finalized (sometimes with a
+    // trailing word or two the interim never showed), or just the tail
+    // segment left after earlier Deepgram segments were dropped with the
+    // interim. Matching is word-based — string prefixes must not match
+    // across word boundaries ("go" vs "google...") — and short utterances
+    // only match exactly, so a real new command is never eaten.
+    isStaleFinal(text) {
+        if (!this.staleFinalText || performance.now() > this.staleFinalUntil) return false;
+        const c = this.staleFinalText.split(' ');
+        const f = normalizedWords(text);
+        if (!f.length) return false;
+        const eq = (a, b) => a.length === b.length && a.every((w, i) => w === b[i]);
+        if (eq(f, c)) return true;                              // re-finalized as-is
+        if (f.length >= 2 && f.length < c.length
+            && eq(f, c.slice(-f.length))) return true;          // tail segment
+        return c.length >= 3 && f.length > c.length && f.length - c.length <= 2
+            && eq(f.slice(0, c.length), c);                     // refined, short new tail
     }
 
     toggleMute() {
@@ -1469,6 +1533,13 @@ class AlexVoiceWidget extends HTMLElement {
 
         if (data.is_final) {
             if (text) dbg.dgFinals++;
+            if (this.isStaleFinal(text)) {
+                // Late final for an utterance the tick() fallback already
+                // committed; text-matched, so real new speech never lands here.
+                if (data.speech_final) this.clearStaleFinalGuard();
+                this.dgFinalParts.length = 0;
+                return;
+            }
             if (hearingAgent) {
                 this.clearInterim();    // same echo rule as Web Speech finals
                 return;
@@ -1478,7 +1549,7 @@ class AlexVoiceWidget extends HTMLElement {
             if (data.speech_final) {
                 this.dgFinalParts.length = 0;
                 this.clearInterim();
-                if (full) this.commitUtterance(full);
+                if (full) this.commitUtterance(full, true);
             } else if (full) {
                 this.setInterim(full);  // segment done, utterance continuing
             }
@@ -1571,13 +1642,13 @@ class AlexVoiceWidget extends HTMLElement {
 
     // ================= CONVERSATION LOOP =================
 
-    commitUtterance(text) {
+    commitUtterance(text, spoken) {
         if (!this.callActive) return;
         const t = text.trim().slice(0, MSG_MAX);
         if (!t) return;
         if (this.turn) this.interrupt('new-utterance');
         this.clearInterim();
-        this.addMsg('user', t);
+        this.addMsg(spoken ? 'user voice' : 'user', spoken ? VOICE_MSG_LABEL : t);
         this.history.push({ role: 'user', content: t });
         this.trimHistory();
         dbg.commits++;
@@ -2004,12 +2075,18 @@ class AlexVoiceWidget extends HTMLElement {
         const now = performance.now();
 
         // Endpointing belt-and-braces: Safari's isFinal is flaky, so a stable
-        // interim + ~900 ms of silence commits the utterance.
+        // interim + ~900 ms of silence commits the utterance. On the Deepgram
+        // engine the window must sit safely ABOVE Deepgram's own endpointing,
+        // or the two race and one utterance commits twice (two bubbles).
+        const endpointMs = this.sttEngine === 'deepgram' ? DG_FALLBACK_MS : ENDPOINT_MS;
         if (this.voiceMode && this.interimText && this.state === 'listening'
-            && now - this.interimAt > ENDPOINT_MS && this.micRms() < 0.05) {
+            && now - this.interimAt > endpointMs && this.micRms() < 0.05) {
             const t = this.interimText;
             this.clearInterim();
-            this.commitUtterance(t);
+            // The engine never endpointed this utterance itself, so a late
+            // final for it (if one ever arrives) is a duplicate — swallow it.
+            this.armStaleFinalGuard(t);
+            this.commitUtterance(t, true);
         }
 
         // Barge-in requires both sustained input energy and a non-echo interim.
@@ -2038,11 +2115,19 @@ class AlexVoiceWidget extends HTMLElement {
         if (left <= 0) {
             this.sysMsg("time's up, thanks for the chat! start another call anytime.");
             this.endCall();
+            // The idle start screen hides the transcript, so the sys message
+            // alone would be invisible — say it on the stateline too.
+            this.noticeFor("time's up, thanks for the chat", 8000);
             return;
         }
         const s = Math.ceil(left / 1000);
         this.timerEl.textContent = Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0');
-        this.timerEl.classList.toggle('low', left <= CALL_WARN_MS);
+        this.timerEl.classList.toggle('low', left <= CALL_WARN_MS && left > CALL_RED_MS);
+        this.timerEl.classList.toggle('red', left <= CALL_RED_MS);
+        if (left <= CALL_RED_MS && !this.timeNoticeShown) {
+            this.timeNoticeShown = true;
+            this.noticeFor('10 seconds left', 4000);
+        }
     }
 
     // ================= CANVAS RENDERING =================

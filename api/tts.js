@@ -10,6 +10,12 @@
 //
 // Upstream: MiniMax T2A v2 (speech-2.8-turbo) SSE stream of hex audio chunks,
 // decoded to bytes here and forwarded as they arrive.
+//
+// Billing: prefers MINIMAX_SUBSCRIPTION_KEY (prepaid Credits pool, spent via
+// the Subscription Key) so voice burns credits, while /api/chat stays on
+// MINIMAX_API_KEY (pay-as-you-go wallet). If the credits attempt fails before
+// producing audio (exhausted credits, auth error, network error), the wallet
+// key is tried.
 
 import { MINIMAX_BASE, checkAccess, globalBudget, rateLimit, readJson, sendJson } from "./_lib.js";
 
@@ -57,9 +63,11 @@ export default async function handler(req, res) {
     return;
   }
 
-  const apiKey = process.env.MINIMAX_API_KEY;
-  if (!apiKey) {
-    console.error("tts: MINIMAX_API_KEY is not set");
+  const keys = [...new Set(
+    [process.env.MINIMAX_SUBSCRIPTION_KEY, process.env.MINIMAX_API_KEY].filter(Boolean),
+  )];
+  if (keys.length === 0) {
+    console.error("tts: neither MINIMAX_SUBSCRIPTION_KEY nor MINIMAX_API_KEY is set");
     sendJson(res, 500, { error: "server_misconfigured" });
     return;
   }
@@ -79,12 +87,17 @@ export default async function handler(req, res) {
     }
   };
 
-  try {
+  // One streaming attempt against one key. Returns "done" when a client
+  // response was fully produced (success or terminal error), or "retry"
+  // when nothing reached the client and the next key may be tried.
+  // Thrown errors (fetch rejection, stream read failure) are the caller's
+  // problem so they can also fall through to the next key.
+  const attempt = async (key, keyTag, lastKey) => {
     const upstream = await fetch(`${MINIMAX_BASE}/v1/t2a_v2`, {
       method: "POST",
       signal: controller.signal,
       headers: {
-        Authorization: `Bearer ${apiKey}`,
+        Authorization: `Bearer ${key}`,
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
@@ -109,9 +122,10 @@ export default async function handler(req, res) {
     });
 
     if (!upstream.ok || !upstream.body) {
-      console.error(`tts: upstream HTTP ${upstream.status}`);
+      console.error(`tts: upstream HTTP ${upstream.status} (${keyTag})`);
+      if (!lastKey) return "retry";
       failBeforeAudio(upstream.status === 429 ? 429 : 502, "upstream_error");
-      return;
+      return "done";
     }
 
     const decoder = new TextDecoder();
@@ -138,9 +152,13 @@ export default async function handler(req, res) {
 
         const code = event?.base_resp?.status_code;
         if (code !== undefined && code !== 0) {
-          console.error(`tts: upstream error code ${code} trace ${event.trace_id || "n/a"}`);
+          console.error(`tts: upstream error code ${code} trace ${event.trace_id || "n/a"} (${keyTag})`);
+          if (!lastKey && !audioStarted) {
+            // Returning early cancels the upstream body stream.
+            return "retry";
+          }
           failBeforeAudio(code === 1002 || code === 1039 ? 429 : 502, "upstream_error");
-          return;
+          return "done";
         }
 
         const hex = event?.data?.audio;
@@ -164,21 +182,42 @@ export default async function handler(req, res) {
 
     if (!audioStarted) {
       // Stream ended without producing any audio.
-      console.error("tts: upstream stream ended with no audio");
+      console.error(`tts: upstream stream ended with no audio (${keyTag})`);
+      if (!lastKey) return "retry";
       sendJson(res, 502, { error: "upstream_error" });
-      return;
+      return "done";
     }
     res.end();
-  } catch (err) {
-    if (controller.signal.aborted) {
+    return "done";
+  };
+
+  try {
+    // Credits pool first, wallet second.
+    for (let k = 0; k < keys.length; k++) {
+      const keyTag = `key ${k + 1}/${keys.length}`;
+      const lastKey = k === keys.length - 1;
+      let outcome;
       try {
-        res.end();
-      } catch {
-        /* already closed */
+        outcome = await attempt(keys[k], keyTag, lastKey);
+      } catch (err) {
+        if (controller.signal.aborted || audioStarted) {
+          // Client gone, timeout fired, or the stream broke mid-audio:
+          // nothing useful left to send.
+          try {
+            res.end();
+          } catch {
+            /* already closed */
+          }
+          return;
+        }
+        console.error(`tts: ${err?.name || "error"} (${keyTag})`);
+        if (lastKey) {
+          failBeforeAudio(502, "upstream_error");
+          return;
+        }
+        outcome = "retry"; // thrown before audio: the next key may still work
       }
-    } else {
-      console.error(`tts: ${err?.name || "error"}`);
-      failBeforeAudio(502, "upstream_error");
+      if (outcome === "done") return;
     }
   } finally {
     clearTimeout(timer);
