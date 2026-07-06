@@ -66,7 +66,6 @@ Python, n8n workflows, VBA / Macros, Git / GitHub, Linux
 - Prompt Engineering for MS Copilot, Microsoft (2025)
 - CS50's Introduction to AI with Python, Harvard University (2025)
 - Vector Search and Embeddings, Google Cloud (2025)
-- AI for Business Leaders, Microsoft (2026)
 
 ## Leadership & Community
 
