@@ -66,6 +66,26 @@ const DG_RATE = 16000;          // linear16 rate sent to Deepgram
 const DG_BATCH_MS = 100;        // mic audio batched into ~100 ms frames
 const DG_KEEPALIVE_MS = 8000;   // silence gap before a KeepAlive keeps the WS warm
 
+// Experimental audio flags for on-device diagnosis; defaults are unchanged
+// for normal visitors. ?as=playback forces the Safari audio-session type
+// (rocker → media volume on iOS); ?aec=off drops echo cancellation so
+// Chromium on Android stays out of the call-volume audio mode (with AEC off
+// the software echo guards are the only thing stopping self-hearing);
+// ?out=stream plays the agent through a MediaStream-backed <audio> element,
+// which Chromium routes on its RTC path — on Android that is the
+// call-volume stream, the one the hardware rocker actually controls while
+// the mic is live, so a low media slider can no longer silence the agent.
+// ?out=cycle instead suspend/resumes the AudioContext once the mic is live:
+// Android pins an output stream to the call- or media-volume channel at
+// CREATION time (chromium media/audio/android/audio_manager_android.cc), and
+// ours is created before the mic flips the device into call mode — one cycle
+// re-creates it on the channel the rocker actually controls during the call.
+const QUERY = new URLSearchParams(window.location.search);
+const AS_OVERRIDE = QUERY.get('as') === 'playback';
+const AEC_OFF = QUERY.get('aec') === 'off';
+const OUT_STREAM = QUERY.get('out') === 'stream';
+const OUT_CYCLE = QUERY.get('out') === 'cycle';
+
 const REDUCED = window.matchMedia
     ? window.matchMedia('(prefers-reduced-motion: reduce)')
     : { matches: false };
@@ -582,6 +602,8 @@ class AlexVoiceWidget extends HTMLElement {
         // Audio graph (lazy)
         this.ctx = null;
         this.playerNode = null;
+        this.msDest = null;             // ?out=stream: MediaStream terminal hop
+        this.streamOutEl = null;        // ?out=stream: hidden <audio> sink
         this.outAnalyser = null;
         this.gain = null;
         this.workletReady = false;
@@ -814,6 +836,14 @@ class AlexVoiceWidget extends HTMLElement {
         if (audioOk) {
             try { await this.ensureWorklet(); } catch (e) { dbg.errors++; }
         }
+        if (voice && OUT_CYCLE && this.ctx) {
+            // Re-create the platform output stream now that the mic has put
+            // the device in call mode (see the ?out=cycle note up top).
+            try {
+                await this.ctx.suspend();
+                await this.ctx.resume();
+            } catch (e) { /* cosmetic only: audio still plays either way */ }
+        }
 
         // The awaits above (mic permission, worklet) can outlive the card:
         // if it was collapsed meanwhile, endCall() no-opped (callActive was
@@ -956,7 +986,7 @@ class AlexVoiceWidget extends HTMLElement {
     applyAudioSession(withMic) {
         try {
             if (navigator.audioSession) {
-                navigator.audioSession.type = withMic ? 'play-and-record' : 'playback';
+                navigator.audioSession.type = (withMic && !AS_OVERRIDE) ? 'play-and-record' : 'playback';
             }
         } catch (e) { /* older browsers: no-op */ }
     }
@@ -987,6 +1017,10 @@ class AlexVoiceWidget extends HTMLElement {
 
     resumeAudio() {
         if (this.ctx && this.ctx.state === 'suspended') this.ctx.resume().catch(() => {});
+        if (this.streamOutEl && this.streamOutEl.paused) {
+            const p = this.streamOutEl.play();
+            if (p && p.catch) p.catch(() => { /* next gesture retries */ });
+        }
     }
 
     async ensureWorklet() {
@@ -1009,7 +1043,19 @@ class AlexVoiceWidget extends HTMLElement {
         this.gain = this.ctx.createGain();
         this.playerNode.connect(this.outAnalyser);
         this.outAnalyser.connect(this.gain);
-        this.gain.connect(this.ctx.destination);
+        if (OUT_STREAM) {
+            // Communications-channel loopback (see the flag block up top):
+            // everything upstream (worklet, analyser, barge-in gain ramp,
+            // frame accounting) is untouched — only the last hop changes.
+            this.msDest = this.ctx.createMediaStreamDestination();
+            this.gain.connect(this.msDest);
+            this.streamOutEl = new Audio();
+            this.streamOutEl.srcObject = this.msDest.stream;
+            const p = this.streamOutEl.play();
+            if (p && p.catch) p.catch(() => { /* retried in resumeAudio */ });
+        } else {
+            this.gain.connect(this.ctx.destination);
+        }
         this.playerNode.port.onmessage = (e) => this.onPlayerMessage(e.data);
         this.workletReady = true;
     }
@@ -1119,7 +1165,9 @@ class AlexVoiceWidget extends HTMLElement {
         if (this.micStream) return;
         const stream = await navigator.mediaDevices.getUserMedia({
             audio: {
-                echoCancellation: true,   // essential: the agent must not hear itself
+                // essential: the agent must not hear itself (AEC_OFF is a
+                // diagnostic flag — see the query-flag block up top)
+                echoCancellation: !AEC_OFF,
                 noiseSuppression: true,
                 autoGainControl: true,
                 channelCount: 1,
