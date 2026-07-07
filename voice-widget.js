@@ -1352,6 +1352,14 @@ class AlexVoiceWidget extends HTMLElement {
             this.interimText = text;
             this.interimAt = performance.now();
         }
+        // While the turn's placeholder is still awaiting an agent reply, it
+        // IS the live indicator: its label flips to "Listening…" instead of
+        // stacking a second bubble underneath (clearInterim flips it back).
+        if (!this.interimEl && this.pendingVoiceEl && this.pendingVoiceEl.isConnected) {
+            this.pendingVoiceEl.textContent = VOICE_INTERIM_LABEL;
+            this.scrollTranscript();
+            return;
+        }
         if (!this.interimEl) {
             this.interimEl = document.createElement('div');
             this.interimEl.className = 'm user interim';
@@ -1364,6 +1372,10 @@ class AlexVoiceWidget extends HTMLElement {
     clearInterim() {
         this.interimText = '';
         this.dgFinalParts.length = 0;   // dropping an interim drops its segments too
+        if (this.pendingVoiceEl && this.pendingVoiceEl.isConnected
+            && this.pendingVoiceEl.textContent !== VOICE_MSG_LABEL) {
+            this.pendingVoiceEl.textContent = VOICE_MSG_LABEL;
+        }
         if (this.interimEl) {
             this.interimEl.remove();
             this.interimEl = null;
@@ -2152,7 +2164,15 @@ class AlexVoiceWidget extends HTMLElement {
         // system line (error, rate limit, mode notice): anything appended
         // below the placeholder breaks adjacency, so the next spoken commit
         // gets a fresh "Voice message" bubble instead of folding upward.
-        if (kind === 'agent' || kind === 'sys') this.pendingVoiceEl = null;
+        // Restore the label first: the placeholder may be mid-"Listening…"
+        // and would otherwise be orphaned in that state.
+        if (kind === 'agent' || kind === 'sys') {
+            if (this.pendingVoiceEl && this.pendingVoiceEl.isConnected
+                && this.pendingVoiceEl.textContent !== VOICE_MSG_LABEL) {
+                this.pendingVoiceEl.textContent = VOICE_MSG_LABEL;
+            }
+            this.pendingVoiceEl = null;
+        }
         const el = document.createElement('div');
         el.className = 'm ' + kind;
         el.textContent = text;
