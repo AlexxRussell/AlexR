@@ -66,27 +66,24 @@ const DG_RATE = 16000;          // linear16 rate sent to Deepgram
 const DG_BATCH_MS = 100;        // mic audio batched into ~100 ms frames
 const DG_KEEPALIVE_MS = 8000;   // silence gap before a KeepAlive keeps the WS warm
 
-// Experimental audio flags for on-device diagnosis; defaults are unchanged
-// for normal visitors. ?as=playback forces the Safari audio-session type
-// (rocker → media volume on iOS); ?aec=off drops echo cancellation so
-// Chromium on Android stays out of the call-volume audio mode (with AEC off
-// the software echo guards are the only thing stopping self-hearing);
-// ?out=stream plays the agent through a MediaStream-backed <audio> element,
-// which Chromium routes on its RTC path — on Android that is the
-// call-volume stream, the one the hardware rocker actually controls while
-// the mic is live, so a low media slider can no longer silence the agent.
-// ?out=cycle instead DEFERS creating the audio output until the mic is live:
 // Android pins an output stream to the call- or media-volume channel at
 // CREATION time (chromium media/audio/android/audio_manager_android.cc), and
-// ours is normally created before the mic flips the device into call mode.
-// Deferring its birth (and suspending it between calls) puts it on the
-// channel the rocker actually controls during the call. Skips the in-gesture
-// iOS unlock, so this flag is Android-only territory.
+// a mic with echo cancellation flips the device into call mode — so an
+// output created before the mic lands on media volume while the hardware
+// rocker controls call volume, and a visitor whose media slider was down
+// hears nothing they can fix. The deferred-output path (OUT_CYCLE) creates
+// the audio output only after the mic is live and parks it between calls,
+// so the rocker controls the agent's voice (device-confirmed on Brave).
+// It skips the in-gesture iOS unlock, so it stays Android-only; ?out=media
+// forces the legacy path, ?out=cycle forces the deferred path elsewhere.
+// Diagnostics: ?as=playback forces the Safari audio-session type; ?aec=off
+// drops echo cancellation (software echo guards only — testing use).
 const QUERY = new URLSearchParams(window.location.search);
 const AS_OVERRIDE = QUERY.get('as') === 'playback';
 const AEC_OFF = QUERY.get('aec') === 'off';
-const OUT_STREAM = QUERY.get('out') === 'stream';
-const OUT_CYCLE = QUERY.get('out') === 'cycle';
+const IS_ANDROID = /android/i.test(navigator.userAgent);
+const OUT_CYCLE = QUERY.get('out') === 'cycle'
+    || (IS_ANDROID && QUERY.get('out') !== 'media');
 
 const REDUCED = window.matchMedia
     ? window.matchMedia('(prefers-reduced-motion: reduce)')
@@ -604,8 +601,6 @@ class AlexVoiceWidget extends HTMLElement {
         // Audio graph (lazy)
         this.ctx = null;
         this.playerNode = null;
-        this.msDest = null;             // ?out=stream: MediaStream terminal hop
-        this.streamOutEl = null;        // ?out=stream: hidden <audio> sink
         this.outAnalyser = null;
         this.gain = null;
         this.workletReady = false;
@@ -1023,15 +1018,12 @@ class AlexVoiceWidget extends HTMLElement {
     }
 
     resumeAudio() {
-        // Under ?out=cycle the context is deliberately parked between calls
-        // (it must be re-created/resumed only after a mic engages call mode),
-        // so the ambient pointerdown/visibility resumes must not wake it.
+        // On the deferred-output path the context is deliberately parked
+        // between calls (it must be re-created/resumed only after a mic
+        // engages call mode), so ambient pointerdown/visibility resumes
+        // must not wake it.
         const parked = OUT_CYCLE && !this.callActive;
         if (!parked && this.ctx && this.ctx.state === 'suspended') this.ctx.resume().catch(() => {});
-        if (this.streamOutEl && this.streamOutEl.paused) {
-            const p = this.streamOutEl.play();
-            if (p && p.catch) p.catch(() => { /* next gesture retries */ });
-        }
     }
 
     async ensureWorklet() {
@@ -1054,19 +1046,7 @@ class AlexVoiceWidget extends HTMLElement {
         this.gain = this.ctx.createGain();
         this.playerNode.connect(this.outAnalyser);
         this.outAnalyser.connect(this.gain);
-        if (OUT_STREAM) {
-            // Communications-channel loopback (see the flag block up top):
-            // everything upstream (worklet, analyser, barge-in gain ramp,
-            // frame accounting) is untouched — only the last hop changes.
-            this.msDest = this.ctx.createMediaStreamDestination();
-            this.gain.connect(this.msDest);
-            this.streamOutEl = new Audio();
-            this.streamOutEl.srcObject = this.msDest.stream;
-            const p = this.streamOutEl.play();
-            if (p && p.catch) p.catch(() => { /* retried in resumeAudio */ });
-        } else {
-            this.gain.connect(this.ctx.destination);
-        }
+        this.gain.connect(this.ctx.destination);
         this.playerNode.port.onmessage = (e) => this.onPlayerMessage(e.data);
         this.workletReady = true;
     }
