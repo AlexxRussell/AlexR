@@ -1,0 +1,11 @@
+{
+  "name": "alexrussell-site-tests",
+  "private": true,
+  "description": "Headless behavioral checks for the voice widget",
+  "scripts": {
+    "test": "node verify-widget.js"
+  },
+  "devDependencies": {
+    "playwright-core": "1.61.1"
+  }
+}

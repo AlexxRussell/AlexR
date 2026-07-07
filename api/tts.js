@@ -167,6 +167,10 @@ export default async function handler(req, res) {
           if (bytes.length === 0) continue;
           if (!audioStarted) {
             audioStarted = true;
+            // Usage visibility: which billing pool served this call. When
+            // "key 2/2" lines start appearing, the Credits pool has run dry
+            // and voice is silently billing the wallet.
+            console.log(`tts: audio started (${keyTag}, ${text.length} chars)`);
             res.statusCode = 200;
             res.setHeader("Content-Type", "application/octet-stream");
             res.setHeader("Cache-Control", "no-cache, no-transform");

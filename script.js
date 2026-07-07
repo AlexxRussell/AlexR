@@ -120,7 +120,7 @@ function runWorkflow() {
     if(btn.disabled) return;
 
     btn.disabled = true;
-    btn.innerHTML = `<i class="fas fa-circle-notch fa-spin mr-2"></i> EXECUTING...`;
+    btn.innerHTML = `<span class="btn-spinner mr-2"></span> EXECUTING...`;
     btn.classList.add('opacity-50', 'cursor-not-allowed');
     
     // Reset styles

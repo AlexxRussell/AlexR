@@ -226,14 +226,28 @@
 
     <link rel="icon" type="image/x-icon" href="images/favicon.ico">
 
-    <script src="https://cdn.tailwindcss.com"></script>
-    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet">
+    <!-- Tailwind is precompiled (no runtime CDN compiler). Regenerate with:
+         npx tailwindcss@3.4.17 -o tw.css --content "index.html,script.js" --minify
+         whenever utility classes change in either file. Icons are inline SVG
+         sprites (defined at the start of the document body) instead of the
+         Font Awesome webfont. -->
+    <link rel="stylesheet" href="tw.css?v=1">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
 
     <link rel="stylesheet" href="style.css">
 </head>
 <body>
-
+    <!-- Icon sprite (Font Awesome 6.4.0 path data, inlined so no
+         webfont or icon CSS is fetched). Referenced via <use>. -->
+    <svg xmlns="http://www.w3.org/2000/svg" style="display:none" aria-hidden="true">
+        <symbol id="i-envelope" viewBox="0 0 512 512"><path d="M48 64C21.5 64 0 85.5 0 112c0 15.1 7.1 29.3 19.2 38.4L236.8 313.6c11.4 8.5 27 8.5 38.4 0L492.8 150.4c12.1-9.1 19.2-23.3 19.2-38.4c0-26.5-21.5-48-48-48H48zM0 176V384c0 35.3 28.7 64 64 64H448c35.3 0 64-28.7 64-64V176L294.4 339.2c-22.8 17.1-54 17.1-76.8 0L0 176z"/></symbol>
+        <symbol id="i-linkedin" viewBox="0 0 448 512"><path d="M416 32H31.9C14.3 32 0 46.5 0 64.3v383.4C0 465.5 14.3 480 31.9 480H416c17.6 0 32-14.5 32-32.3V64.3c0-17.8-14.4-32.3-32-32.3zM135.4 416H69V202.2h66.5V416zm-33.2-243c-21.3 0-38.5-17.3-38.5-38.5S80.9 96 102.2 96c21.2 0 38.5 17.3 38.5 38.5 0 21.3-17.2 38.5-38.5 38.5zm282.1 243h-66.4V312c0-24.8-.5-56.7-34.5-56.7-34.6 0-39.9 27-39.9 54.9V416h-66.4V202.2h63.7v29.2h.9c8.9-16.8 30.6-34.5 62.9-34.5 67.2 0 79.7 44.3 79.7 101.9V416z"/></symbol>
+        <symbol id="i-brain" viewBox="0 0 512 512"><path d="M184 0c30.9 0 56 25.1 56 56V456c0 30.9-25.1 56-56 56c-28.9 0-52.7-21.9-55.7-50.1c-5.2 1.4-10.7 2.1-16.3 2.1c-35.3 0-64-28.7-64-64c0-7.4 1.3-14.6 3.6-21.2C21.4 367.4 0 338.2 0 304c0-31.9 18.7-59.5 45.8-72.3C37.1 220.8 32 207 32 192c0-30.7 21.6-56.3 50.4-62.6C80.8 123.9 80 118 80 112c0-29.9 20.6-55.1 48.3-62.1C131.3 21.9 155.1 0 184 0zM328 0c28.9 0 52.6 21.9 55.7 49.9c27.8 7 48.3 32.1 48.3 62.1c0 6-.8 11.9-2.4 17.4c28.8 6.2 50.4 31.9 50.4 62.6c0 15-5.1 28.8-13.8 39.7C493.3 244.5 512 272.1 512 304c0 34.2-21.4 63.4-51.6 74.8c2.3 6.6 3.6 13.8 3.6 21.2c0 35.3-28.7 64-64 64c-5.6 0-11.1-.7-16.3-2.1c-3 28.2-26.8 50.1-55.7 50.1c-30.9 0-56-25.1-56-56V56c0-30.9 25.1-56 56-56z"/></symbol>
+        <symbol id="i-check" viewBox="0 0 448 512"><path d="M438.6 105.4c12.5 12.5 12.5 32.8 0 45.3l-256 256c-12.5 12.5-32.8 12.5-45.3 0l-128-128c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0L160 338.7 393.4 105.4c12.5-12.5 32.8-12.5 45.3 0z"/></symbol>
+        <symbol id="i-external" viewBox="0 0 512 512"><path d="M320 0c-17.7 0-32 14.3-32 32s14.3 32 32 32h82.7L201.4 265.4c-12.5 12.5-12.5 32.8 0 45.3s32.8 12.5 45.3 0L448 109.3V192c0 17.7 14.3 32 32 32s32-14.3 32-32V32c0-17.7-14.3-32-32-32H320zM80 32C35.8 32 0 67.8 0 112V432c0 44.2 35.8 80 80 80H400c44.2 0 80-35.8 80-80V320c0-17.7-14.3-32-32-32s-32 14.3-32 32V432c0 8.8-7.2 16-16 16H80c-8.8 0-16-7.2-16-16V112c0-8.8 7.2-16 16-16H192c17.7 0 32-14.3 32-32s-14.3-32-32-32H80z"/></symbol>
+    </svg>
     <nav id="sticky-nav" class="fixed top-0 left-0 w-full z-50 shadow-[0_4px_30px_rgba(0,0,0,0.8)] border-b border-gray-800">
         <div class="w-full px-6 md:px-10 py-4 flex justify-between items-center">
             
@@ -272,8 +286,8 @@
                     </div>
 
                     <div class="flex flex-wrap gap-5 justify-center md:justify-start">
-                        <a href="mailto:me@alexrussell.io?subject=Inquiry%20from%20alexrussell.io&body=Hi%20Alexander%2C%20I%20reviewed%20your%20portfolio%20and%20would%20like%20to%20discuss..." class="header-btn px-6 py-3 text-sm md:text-base"><i class="fas fa-envelope mr-2"></i>Email</a>
-                        <a href="https://www.linkedin.com/in/alexrussell-tech" target="_blank" rel="noopener noreferrer" class="header-btn px-6 py-3 text-sm md:text-base"><i class="fab fa-linkedin mr-2"></i>LinkedIn</a>
+                        <a href="mailto:me@alexrussell.io?subject=Inquiry%20from%20alexrussell.io&body=Hi%20Alexander%2C%20I%20reviewed%20your%20portfolio%20and%20would%20like%20to%20discuss..." class="header-btn px-6 py-3 text-sm md:text-base"><svg class="svg-icon mr-2" fill="currentColor" aria-hidden="true"><use href="#i-envelope"/></svg>Email</a>
+                        <a href="https://www.linkedin.com/in/alexrussell-tech" target="_blank" rel="noopener noreferrer" class="header-btn px-6 py-3 text-sm md:text-base"><svg class="svg-icon mr-2" fill="currentColor" aria-hidden="true"><use href="#i-linkedin"/></svg>LinkedIn</a>
                         <a href="https://atvora.com" target="_blank" rel="noopener noreferrer" class="header-btn px-6 py-3 text-sm md:text-base inline-flex items-center"><img src="images/atvora.png" alt="" class="inline-block w-5 h-5 mr-2 align-middle rounded-md border border-green-500/70">Atvora</a>
                     </div>
                 </div>
@@ -351,7 +365,7 @@
                     <div class="flex items-center justify-between w-full px-2">
                         <div class="flex flex-col items-center z-10 w-1/4">
                             <div id="node1" class="w-16 h-16 md:w-20 md:h-20 border-2 border-gray-700 rounded-lg flex items-center justify-center text-gray-600 bg-black transition-all duration-300">
-                                <i class="fas fa-envelope text-2xl md:text-3xl"></i>
+                                <svg class="svg-icon text-2xl md:text-3xl" fill="currentColor" aria-hidden="true"><use href="#i-envelope"/></svg>
                             </div>
                             <span class="text-[10px] text-gray-500 mt-2 font-mono uppercase tracking-wider">Inquiry</span>
                         </div>
@@ -362,7 +376,7 @@
 
                         <div class="flex flex-col items-center z-10 w-1/4">
                             <div id="node2" class="w-16 h-16 md:w-20 md:h-20 border-2 border-gray-700 rounded-lg flex items-center justify-center text-gray-600 bg-black transition-all duration-300">
-                                <i class="fas fa-brain text-2xl md:text-3xl"></i>
+                                <svg class="svg-icon text-2xl md:text-3xl" fill="currentColor" aria-hidden="true"><use href="#i-brain"/></svg>
                             </div>
                             <span class="text-[10px] text-gray-500 mt-2 font-mono uppercase tracking-wider">Processing</span>
                         </div>
@@ -373,7 +387,7 @@
 
                         <div class="flex flex-col items-center z-10 w-1/4">
                             <div id="node3" class="w-16 h-16 md:w-20 md:h-20 border-2 border-gray-700 rounded-lg flex items-center justify-center text-gray-600 bg-black transition-all duration-300">
-                                <i class="fas fa-check text-2xl md:text-3xl"></i>
+                                <svg class="svg-icon text-2xl md:text-3xl" fill="currentColor" aria-hidden="true"><use href="#i-check"/></svg>
                             </div>
                             <span class="text-[10px] text-gray-500 mt-2 font-mono uppercase tracking-wider">Connected</span>
                         </div>
@@ -414,7 +428,7 @@
                 <div class="md:col-span-1 flex justify-center md:justify-start">
                     <div class="relative group w-full max-w-[280px]">
                         <div class="relative border border-green-500/50 hover:border-green-500 hover:shadow-[0_0_20px_rgba(0,255,0,0.5)] transition duration-300 overflow-hidden inline-block">
-                            <img src="images/Alex2.jpg" alt="Alexander Russell" class="max-w-full h-auto max-h-[400px] block transition duration-500">
+                            <img loading="lazy" decoding="async" src="images/Alex2.jpg" alt="Alexander Russell" class="max-w-full h-auto max-h-[400px] block transition duration-500">
                         </div>
                         <div class="text-center mt-3 text-[10px] text-green-500 font-mono tracking-widest">[IMG: A_RUSSELL.JPG]</div>
                     </div>
@@ -477,7 +491,7 @@
 
                         <div class="timeline-company">
                             <div class="timeline-logo-container">
-                                <img src="images/Webbased.png" alt="Webbased AI" class="timeline-logo">
+                                <img loading="lazy" decoding="async" src="images/Webbased.png" alt="Webbased AI" class="timeline-logo">
                             </div>
                             <span class="timeline-company-name">Webbased AI</span>
                         </div>
@@ -512,7 +526,7 @@
                         
                         <div class="timeline-company">
                             <div class="timeline-logo-container">
-                                <img src="images/Harkness.jpg" alt="Harkness AI" class="timeline-logo">
+                                <img loading="lazy" decoding="async" src="images/Harkness.jpg" alt="Harkness AI" class="timeline-logo">
                             </div>
                             <span class="timeline-company-name">Harkness AI</span>
                         </div>
@@ -557,7 +571,7 @@
                         
                         <div class="timeline-company">
                             <div class="timeline-logo-container rounded-full">
-                                <img src="images/Studypoints.png" alt="StudyPoints" class="timeline-logo">
+                                <img loading="lazy" decoding="async" src="images/Studypoints.png" alt="StudyPoints" class="timeline-logo">
                             </div>
                             <span class="timeline-company-name">StudyPoints</span>
                         </div>
@@ -588,7 +602,7 @@
                         
                         <div class="timeline-company">
                             <div class="timeline-logo-container">
-                                <img src="images/UniLodge.jpg" alt="UniLodge" class="timeline-logo">
+                                <img loading="lazy" decoding="async" src="images/UniLodge.jpg" alt="UniLodge" class="timeline-logo">
                             </div>
                             <span class="timeline-company-name">UniLodge (University of Canterbury)</span>
                         </div>
@@ -612,7 +626,7 @@
                         
                         <div class="timeline-company">
                             <div class="timeline-logo-container">
-                                <img src="images/IJG.png" alt="IJG Trails" class="timeline-logo">
+                                <img loading="lazy" decoding="async" src="images/IJG.png" alt="IJG Trails" class="timeline-logo">
                             </div>
                             <span class="timeline-company-name">IJG Trails</span>
                         </div>
@@ -645,7 +659,7 @@
                         <div class="flex flex-col items-center w-full p-6 gap-6">
                             
                             <div class="flex-shrink-0 bg-white rounded-xl flex items-center justify-center p-4 shadow-lg">
-                                <img src="images/AIForum.png" alt="AI Forum NZ" class="h-16 w-auto object-contain">
+                                <img loading="lazy" decoding="async" src="images/AIForum.png" alt="AI Forum NZ" class="h-16 w-auto object-contain">
                             </div>
 
                             <div class="flex-1 text-left md:text-center">
@@ -669,7 +683,7 @@
                     <div class="glass-panel p-6 relative group transition-all duration-300 animated-border-box">
                         <div class="flex items-start gap-4">
                             <div class="flex-shrink-0 w-14 h-14 bg-black border border-gray-800 rounded-lg p-1 flex items-center justify-center shadow-lg group-hover:border-green-500/50 transition duration-300">
-                                <img src="images/AfroSoc.jpg" alt="African Society" class="w-full h-full object-contain">
+                                <img loading="lazy" decoding="async" src="images/AfroSoc.jpg" alt="African Society" class="w-full h-full object-contain">
                             </div>
 
                             <div class="flex-1 flex flex-col gap-3">
@@ -691,7 +705,7 @@
                     <div class="glass-panel p-6 relative group transition-all duration-300 animated-border-box">
                         <div class="flex items-start gap-4">
                             <div class="flex-shrink-0 w-14 h-14 bg-black border border-gray-800 rounded-lg p-1 flex items-center justify-center shadow-lg group-hover:border-green-500/50 transition duration-300">
-                                <img src="images/UniLodge.jpg" alt="UniLodge" class="w-full h-full object-contain">
+                                <img loading="lazy" decoding="async" src="images/UniLodge.jpg" alt="UniLodge" class="w-full h-full object-contain">
                             </div>
                             
                             <div class="flex-1 flex flex-col gap-3">
@@ -719,7 +733,7 @@
             <div class="job-block group">
                 <div class="flex items-center gap-5 mb-4">
                     <div class="flex-shrink-0 w-14 h-14 bg-black border border-gray-800 rounded-lg p-1 flex items-center justify-center shadow-lg group-hover:border-green-500/50 transition duration-300">
-                        <img src="images/UC.jpg" alt="University of Canterbury" class="w-full h-full object-contain transition-all duration-300">
+                        <img loading="lazy" decoding="async" src="images/UC.jpg" alt="University of Canterbury" class="w-full h-full object-contain transition-all duration-300">
                     </div>
                     
                     <div class="flex-1">
@@ -752,7 +766,7 @@
             <div class="job-block group">
                 <div class="flex items-center gap-5 mb-4">
                     <div class="flex-shrink-0 w-14 h-14 bg-black border border-gray-800 rounded-lg p-1 flex items-center justify-center shadow-lg group-hover:border-green-500/50 transition duration-300">
-                        <img src="images/WAP.jpg" alt="Windhoek Afrikaans Private School" class="w-full h-full object-contain transition-all duration-300">
+                        <img loading="lazy" decoding="async" src="images/WAP.jpg" alt="Windhoek Afrikaans Private School" class="w-full h-full object-contain transition-all duration-300">
                     </div>
 
                     <div class="flex-1">
@@ -778,13 +792,13 @@
                 <a href="https://www.linkedin.com/in/alexrussell-tech/details/certifications/" target="_blank" rel="noopener noreferrer" class="cert-card p-4 border border-gray-800 bg-gray-900/20 animated-border-box transition duration-300 group rounded-lg flex items-center">
                     <div class="flex items-center gap-4 w-full">
                         <div class="w-12 h-12 rounded-full bg-white flex items-center justify-center overflow-hidden flex-shrink-0 border border-gray-600 group-hover:border-green-500 transition">
-                            <img src="images/Microsoft.jpg" alt="Microsoft" class="w-full h-full object-cover">
+                            <img loading="lazy" decoding="async" src="images/Microsoft.jpg" alt="Microsoft" class="w-full h-full object-cover">
                         </div>
                         <div class="flex-1">
                             <strong class="text-white block mb-1 group-hover:text-green-500 transition text-base">Prompt Engineering for MS Copilot</strong>
                             <span class="text-gray-500 text-xs uppercase tracking-wide">Microsoft (2025)</span>
                         </div>
-                        <i class="fas fa-external-link-alt text-gray-700 group-hover:text-green-500 ml-2"></i>
+                        <svg class="svg-icon text-gray-700 group-hover:text-green-500 ml-2" fill="currentColor" aria-hidden="true"><use href="#i-external"/></svg>
                     </div>
                 </a>
 
@@ -792,13 +806,13 @@
                     <div class="flex items-center gap-4 w-full">
                         <!-- LOGO CIRCLE -->
                         <div class="w-12 h-12 rounded-full bg-white flex items-center justify-center overflow-hidden flex-shrink-0 border border-gray-600 group-hover:border-green-500 transition">
-                            <img src="images/Harvard.jpg" alt="Harvard" class="w-full h-full object-cover">
+                            <img loading="lazy" decoding="async" src="images/Harvard.jpg" alt="Harvard" class="w-full h-full object-cover">
                         </div>
                         <div class="flex-1">
                             <strong class="text-white block mb-1 group-hover:text-green-500 transition text-base">CS50's Intro to AI with Python</strong>
                             <span class="text-gray-500 text-xs uppercase tracking-wide">Harvard University (2025)</span>
                         </div>
-                        <i class="fas fa-external-link-alt text-gray-700 group-hover:text-green-500 ml-2"></i>
+                        <svg class="svg-icon text-gray-700 group-hover:text-green-500 ml-2" fill="currentColor" aria-hidden="true"><use href="#i-external"/></svg>
                     </div>
                 </a>
 
@@ -806,39 +820,39 @@
                     <div class="flex items-center gap-4 w-full">
                         <!-- LOGO CIRCLE -->
                         <div class="w-12 h-12 rounded-full bg-white flex items-center justify-center overflow-hidden flex-shrink-0 border border-gray-600 group-hover:border-green-500 transition">
-                            <img src="images/Google.jpg" alt="Google" class="w-full h-full object-cover">
+                            <img loading="lazy" decoding="async" src="images/Google.jpg" alt="Google" class="w-full h-full object-cover">
                         </div>
                         <div class="flex-1">
                             <strong class="text-white block mb-1 group-hover:text-green-500 transition text-base">Vector Search and Embeddings</strong>
                             <span class="text-gray-500 text-xs uppercase tracking-wide">Google Cloud (2025)</span>
                         </div>
-                        <i class="fas fa-external-link-alt text-gray-700 group-hover:text-green-500 ml-2"></i>
+                        <svg class="svg-icon text-gray-700 group-hover:text-green-500 ml-2" fill="currentColor" aria-hidden="true"><use href="#i-external"/></svg>
                     </div>
                 </a>
 
                 <a href="https://www.linkedin.com/in/alexrussell-tech/details/certifications/" target="_blank" rel="noopener noreferrer" class="cert-card p-4 border border-gray-800 bg-gray-900/20 animated-border-box transition duration-300 group rounded-lg flex items-center">
                     <div class="flex items-center gap-4 w-full">
                         <div class="w-12 h-12 rounded-full bg-white flex items-center justify-center overflow-hidden flex-shrink-0 border border-gray-600 group-hover:border-green-500 transition">
-                            <img src="images/Cybrary-light.png" alt="Cybrary" class="w-full h-full object-cover">
+                            <img loading="lazy" decoding="async" src="images/Cybrary-light.png" alt="Cybrary" class="w-full h-full object-cover">
                         </div>
                         <div class="flex-1">
                             <strong class="text-white block mb-1 group-hover:text-green-500 transition text-base">Kali Linux Fundamentals</strong>
                             <span class="text-gray-500 text-xs uppercase tracking-wide">Cybrary (2019)</span>
                         </div>
-                        <i class="fas fa-external-link-alt text-gray-700 group-hover:text-green-500 ml-2"></i>
+                        <svg class="svg-icon text-gray-700 group-hover:text-green-500 ml-2" fill="currentColor" aria-hidden="true"><use href="#i-external"/></svg>
                     </div>
                 </a>
 
                 <a href="https://www.linkedin.com/in/alexrussell-tech/details/certifications/" target="_blank" rel="noopener noreferrer" class="cert-card p-4 border border-gray-800 bg-gray-900/20 animated-border-box transition duration-300 group rounded-lg flex items-center">
                     <div class="flex items-center gap-4 w-full">
                         <div class="w-12 h-12 rounded-full bg-black flex items-center justify-center overflow-hidden flex-shrink-0 border border-gray-600 group-hover:border-green-500 transition">
-                            <img src="images/Cybrary.png" alt="Cybrary" class="w-full h-full object-cover">
+                            <img loading="lazy" decoding="async" src="images/Cybrary.png" alt="Cybrary" class="w-full h-full object-cover">
                         </div>
                         <div class="flex-1">
                             <strong class="text-white block mb-1 group-hover:text-green-500 transition text-base">Penetration Testing & Ethical Hacking</strong>
                             <span class="text-gray-500 text-xs uppercase tracking-wide">Cybrary (2018)</span>
                         </div>
-                        <i class="fas fa-external-link-alt text-gray-700 group-hover:text-green-500 ml-2"></i>
+                        <svg class="svg-icon text-gray-700 group-hover:text-green-500 ml-2" fill="currentColor" aria-hidden="true"><use href="#i-external"/></svg>
                     </div>
                 </a>
 

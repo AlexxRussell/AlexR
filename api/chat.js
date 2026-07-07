@@ -129,6 +129,9 @@ export default async function handler(req, res) {
     sendJson(res, 400, { error: "invalid_messages" });
     return;
   }
+  // Usage visibility: one line per turn makes conversation volume greppable
+  // in the function logs without any client-side analytics weight.
+  console.log(`chat: turn started (history ${messages.length})`);
 
   const apiKey = process.env.MINIMAX_API_KEY;
   if (!apiKey) {

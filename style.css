@@ -612,3 +612,27 @@ h2::before { content: "> "; color: var(--terminal-green); }
     0%, 80%, 100% { opacity: 0; }
     40% { opacity: 1; }
 }
+
+/* Inline icon sprites (replaced the Font Awesome webfont): sized and
+   baseline-aligned the way FA glyphs were, tracking font-size and color. */
+.svg-icon {
+    display: inline-block;
+    width: 1em;
+    height: 1em;
+    vertical-align: -0.125em;
+}
+
+/* Contact-protocol button spinner (replaced fa-circle-notch fa-spin). */
+.btn-spinner {
+    display: inline-block;
+    width: 1em;
+    height: 1em;
+    vertical-align: -0.125em;
+    border: 2px solid currentColor;
+    border-top-color: transparent;
+    border-radius: 50%;
+    animation: btn-spin 0.8s linear infinite;
+}
+@keyframes btn-spin {
+    to { transform: rotate(360deg); }
+}
