@@ -75,11 +75,13 @@ const DG_KEEPALIVE_MS = 8000;   // silence gap before a KeepAlive keeps the WS w
 // which Chromium routes on its RTC path — on Android that is the
 // call-volume stream, the one the hardware rocker actually controls while
 // the mic is live, so a low media slider can no longer silence the agent.
-// ?out=cycle instead suspend/resumes the AudioContext once the mic is live:
+// ?out=cycle instead DEFERS creating the audio output until the mic is live:
 // Android pins an output stream to the call- or media-volume channel at
 // CREATION time (chromium media/audio/android/audio_manager_android.cc), and
-// ours is created before the mic flips the device into call mode — one cycle
-// re-creates it on the channel the rocker actually controls during the call.
+// ours is normally created before the mic flips the device into call mode.
+// Deferring its birth (and suspending it between calls) puts it on the
+// channel the rocker actually controls during the call. Skips the in-gesture
+// iOS unlock, so this flag is Android-only territory.
 const QUERY = new URLSearchParams(window.location.search);
 const AS_OVERRIDE = QUERY.get('as') === 'playback';
 const AEC_OFF = QUERY.get('aec') === 'off';
@@ -644,6 +646,7 @@ class AlexVoiceWidget extends HTMLElement {
         this.dgFinalParts = [];         // is_final segments awaiting speech_final
         this.staleFinalText = '';       // tick() committed ahead of the engine:
         this.staleFinalUntil = 0;       // matching finals are dupes until then
+        this.pendingVoiceEl = null;     // the turn's placeholder until the agent replies
         this.dgLastAudioAt = 0;
         this.dgKeepAliveTimer = 0;
         this.dgReconnected = false;     // one mid-call reconnect, then fallback
@@ -741,12 +744,8 @@ class AlexVoiceWidget extends HTMLElement {
                 'replies are still spoken.';
         }
 
-        if (REDUCED.matches) {
-            this.drawMini(0);
-            this.drawOrbStatic();
-        } else {
-            this.startLoop();
-        }
+        this.drawMini(0);
+        this.startLoop();   // reduced motion runs the calm renderer inside the loop
     }
 
     // ================= STATE MACHINE =================
@@ -758,7 +757,6 @@ class AlexVoiceWidget extends HTMLElement {
         this.card.dataset.state = s;
         this.updateStateline();
         window.dispatchEvent(new CustomEvent('alexvoice:state', { detail: { state: s } }));
-        if (REDUCED.matches) this.drawOrbStatic();
     }
 
     updateStateline() {
@@ -791,8 +789,7 @@ class AlexVoiceWidget extends HTMLElement {
             this.orbSize = w;
             this.orb2d = this.setupCanvas(this.orbCv, w);
         }
-        if (REDUCED.matches) this.drawOrbStatic();
-        else this.startLoop();
+        this.startLoop();
         (this.callActive ? this.field : (this.startBtn.hidden ? this.textBtn : this.startBtn)).focus();
     }
 
@@ -817,9 +814,10 @@ class AlexVoiceWidget extends HTMLElement {
         // its scroll position; re-pin it to the latest messages.
         this.scrollTranscript();
 
-        // Audio unlock must start synchronously inside this click gesture.
+        // Audio unlock must start synchronously inside this click gesture
+        // (?out=cycle defers it until after the mic — see the flag block).
         this.applyAudioSession(withVoice);
-        const audioOk = this.ensureContextSync();
+        const audioOk = OUT_CYCLE ? true : this.ensureContextSync();
 
         let voice = withVoice && !!SR_CTOR;
         if (withVoice && !SR_CTOR) {
@@ -833,16 +831,19 @@ class AlexVoiceWidget extends HTMLElement {
                 this.sysMsg('mic unavailable, text mode enabled; replies are still spoken.');
             }
         }
+        if (OUT_CYCLE) {
+            // Create (first call) or wake (later calls) the output AFTER the
+            // mic has switched the device into call mode, so the platform
+            // output stream is born on the call-volume channel. Direct
+            // resume: callActive is not set yet, so resumeAudio() would
+            // treat the context as parked. The mic graph could not attach
+            // inside ensureMic (no context existed yet) — attach it now.
+            if (!this.ctx) this.ensureContextSync();
+            else if (this.ctx.state === 'suspended') this.ctx.resume().catch(() => {});
+            try { this.attachMicGraph(); } catch (e) { dbg.errors++; }
+        }
         if (audioOk) {
             try { await this.ensureWorklet(); } catch (e) { dbg.errors++; }
-        }
-        if (voice && OUT_CYCLE && this.ctx) {
-            // Re-create the platform output stream now that the mic has put
-            // the device in call mode (see the ?out=cycle note up top).
-            try {
-                await this.ctx.suspend();
-                await this.ctx.resume();
-            } catch (e) { /* cosmetic only: audio still plays either way */ }
         }
 
         // The awaits above (mic permission, worklet) can outlive the card:
@@ -909,6 +910,7 @@ class AlexVoiceWidget extends HTMLElement {
         dbg.sttEngine = null;
         this.clearInterim();
         this.clearStaleFinalGuard();
+        this.pendingVoiceEl = null;
         if (this.micStream) {
             this.micStream.getTracks().forEach((t) => t.stop());
             this.micStream = null;
@@ -925,6 +927,11 @@ class AlexVoiceWidget extends HTMLElement {
         dbg.mode = null;
         this.inputRow.hidden = true;
         this.startPanel.hidden = false;
+        if (OUT_CYCLE && this.ctx) {
+            // Park the output between calls so the next call re-creates the
+            // platform stream after ITS mic engages call mode.
+            try { this.ctx.suspend().catch(() => {}); } catch (e) { /* ignore */ }
+        }
         this.setState('idle');
     }
 
@@ -1016,7 +1023,11 @@ class AlexVoiceWidget extends HTMLElement {
     }
 
     resumeAudio() {
-        if (this.ctx && this.ctx.state === 'suspended') this.ctx.resume().catch(() => {});
+        // Under ?out=cycle the context is deliberately parked between calls
+        // (it must be re-created/resumed only after a mic engages call mode),
+        // so the ambient pointerdown/visibility resumes must not wake it.
+        const parked = OUT_CYCLE && !this.callActive;
+        if (!parked && this.ctx && this.ctx.state === 'suspended') this.ctx.resume().catch(() => {});
         if (this.streamOutEl && this.streamOutEl.paused) {
             const p = this.streamOutEl.play();
             if (p && p.catch) p.catch(() => { /* next gesture retries */ });
@@ -1180,14 +1191,20 @@ class AlexVoiceWidget extends HTMLElement {
                 if (this.callActive) this.enterTextMode('mic disconnected, text mode enabled.');
             };
         }
-        if (this.ctx) {
-            this.micSource = this.ctx.createMediaStreamSource(stream);
-            this.micAnalyser = this.ctx.createAnalyser();
-            this.micAnalyser.fftSize = 2048;
-            this.micAnalyser.smoothingTimeConstant = 0.5;
-            this.micBuf = new Uint8Array(this.micAnalyser.fftSize);
-            this.micSource.connect(this.micAnalyser);  // analysis only, never to destination
-        }
+        this.attachMicGraph();
+    }
+
+    // Wires the mic into the context for RMS analysis (and, downstream, the
+    // Deepgram capture node). Separate from ensureMic because ?out=cycle
+    // defers context creation until after the mic exists.
+    attachMicGraph() {
+        if (!this.ctx || !this.micStream || this.micSource) return;
+        this.micSource = this.ctx.createMediaStreamSource(this.micStream);
+        this.micAnalyser = this.ctx.createAnalyser();
+        this.micAnalyser.fftSize = 2048;
+        this.micAnalyser.smoothingTimeConstant = 0.5;
+        this.micBuf = new Uint8Array(this.micAnalyser.fftSize);
+        this.micSource.connect(this.micAnalyser);  // analysis only, never to destination
     }
 
     rmsOf(analyser, buf) {
@@ -1756,7 +1773,13 @@ class AlexVoiceWidget extends HTMLElement {
         if (!t) return;
         if (this.turn) this.interrupt('new-utterance');
         this.clearInterim();
-        this.addMsg(spoken ? 'user voice' : 'user', spoken ? VOICE_MSG_LABEL : t);
+        // One visible "Voice message" per turn: until the agent has replied,
+        // further spoken commits fold into the same placeholder instead of
+        // stacking bubbles (a split utterance would read as a glitch).
+        if (!(spoken && this.pendingVoiceEl && this.pendingVoiceEl.isConnected)) {
+            const el = this.addMsg(spoken ? 'user voice' : 'user', spoken ? VOICE_MSG_LABEL : t);
+            this.pendingVoiceEl = spoken ? el : null;
+        }
         this.history.push({ role: 'user', content: t });
         this.trimHistory();
         dbg.commits++;
@@ -2145,6 +2168,11 @@ class AlexVoiceWidget extends HTMLElement {
     // ================= TRANSCRIPT =================
 
     addMsg(kind, text) {
+        // An agent reply closes the user's visible turn — and so does any
+        // system line (error, rate limit, mode notice): anything appended
+        // below the placeholder breaks adjacency, so the next spoken commit
+        // gets a fresh "Voice message" bubble instead of folding upward.
+        if (kind === 'agent' || kind === 'sys') this.pendingVoiceEl = null;
         const el = document.createElement('div');
         el.className = 'm ' + kind;
         el.textContent = text;
@@ -2252,7 +2280,7 @@ class AlexVoiceWidget extends HTMLElement {
     }
 
     startLoop() {
-        if (this.rafId || REDUCED.matches) return;
+        if (this.rafId) return;
         const step = (ts) => {
             this.rafId = requestAnimationFrame(step);
             this.frame(ts);
@@ -2271,6 +2299,17 @@ class AlexVoiceWidget extends HTMLElement {
         const dt = this.lastTs ? Math.min(ts - this.lastTs, 100) : 16;
         this.lastTs = ts;
         if (document.hidden) return;
+
+        if (REDUCED.matches) {
+            // Calm renderer: reduced motion gets slow, minimal movement
+            // instead of a frozen orb that reads as "stuck". ~12 fps.
+            this.miniAcc += dt;
+            if (this.miniAcc < 80) return;
+            this.miniAcc = 0;
+            if (this.card.hidden) this.drawMini(ts);
+            else this.drawOrbCalm(ts);
+            return;
+        }
 
         if (this.card.hidden) {
             // Collapsed: subtle launcher breath at ~12 fps.
@@ -2396,14 +2435,28 @@ class AlexVoiceWidget extends HTMLElement {
         }
     }
 
-    // Reduced motion: a single static disc; CSS supplies a soft opacity pulse.
-    drawOrbStatic() {
+    // Reduced motion: everything slow and small — a gentle breathe, a level
+    // swell, and slowly turning thinking arcs. No wobble, rings, or dust:
+    // "reduced" means no vestibular-trigger motion, not a frozen UI that
+    // visitors read as broken.
+    drawOrbCalm(ts) {
         const c = this.orb2d;
         const S = this.orbSize;
         if (!c) return;
+        let target;
+        switch (this.state) {
+            case 'speaking':  target = Math.min(1, this.outRms() * 2.4); break;
+            case 'listening': target = this.voiceMode ? Math.min(1, this.micRms() * 2.8) : 0.1; break;
+            case 'thinking':  target = 0.25; break;
+            case 'connecting': target = 0.18; break;
+            default:          target = 0.08;
+        }
+        this.level += (target - this.level) * 0.15;
+        const level = Math.max(0, Math.min(1, this.level));
         c.clearRect(0, 0, S, S);
         const cx = S / 2, cy = S / 2;
-        const R = S * 0.28;
+        const t = ts / 1000;
+        const R = S * 0.27 * (1 + 0.03 * Math.sin(t * 0.8) + level * 0.12);
         const [r, g, b] = this.orbColor();
         const grad = c.createRadialGradient(cx - R * 0.25, cy - R * 0.3, R * 0.1, cx, cy, R * 1.2);
         grad.addColorStop(0, 'rgba(235,255,240,0.95)');
@@ -2411,12 +2464,27 @@ class AlexVoiceWidget extends HTMLElement {
         grad.addColorStop(1, 'rgba(' + Math.round(r * 0.2) + ',' + Math.round(g * 0.25) + ',' + Math.round(b * 0.2) + ',0.9)');
         c.save();
         c.shadowColor = 'rgba(' + r + ',' + g + ',' + b + ',0.7)';
-        c.shadowBlur = 18;
+        c.shadowBlur = 14 + level * 20;
         c.fillStyle = grad;
         c.beginPath();
         c.arc(cx, cy, R, 0, Math.PI * 2);
         c.fill();
         c.restore();
+
+        if (this.state === 'thinking') {
+            const pR = Math.min(R * 1.62, S * 0.47);
+            c.save();
+            c.lineWidth = 2;
+            c.lineCap = 'round';
+            c.strokeStyle = 'rgba(' + r + ',' + g + ',' + b + ',0.55)';
+            for (let i = 0; i < 2; i++) {
+                const a0 = t * 0.6 + i * Math.PI;
+                c.beginPath();
+                c.arc(cx, cy, pR, a0, a0 + 1.15);
+                c.stroke();
+            }
+            c.restore();
+        }
     }
 
     // Launcher: 4 centered Siri-style pill bars with a slow breath.
@@ -2429,7 +2497,7 @@ class AlexVoiceWidget extends HTMLElement {
         const x0 = (24 - total) / 2;
         c.fillStyle = 'rgba(0,255,65,0.9)';
         for (let i = 0; i < n; i++) {
-            const breath = REDUCED.matches ? 0.5 : 0.5 + 0.5 * Math.sin(ts / 700 + i * 0.9);
+            const breath = 0.5 + 0.5 * Math.sin(ts / (REDUCED.matches ? 2200 : 700) + i * 0.9);
             const h = 5 + 9 * breath * (i === 1 || i === 2 ? 1 : 0.65);
             const x = x0 + i * (barW + gap);
             const y = 12 - h / 2;
