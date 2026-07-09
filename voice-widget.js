@@ -49,7 +49,7 @@ const GREETING = "Hey, I'm Alexander's AI. Ask me anything about his work.";
 // glitches); the transcript shows placeholders while the LLM gets the text.
 const VOICE_MSG_LABEL = 'Voice message';
 const VOICE_INTERIM_LABEL = 'Listening…';
-const CALL_MAX_MS = 120_000;    // voice calls end themselves after two minutes
+const CALL_MAX_MS = 150_000;    // voice calls end themselves after two and a half minutes
 const CALL_WARN_MS = 15_000;    // countdown turns amber for the final stretch
 const CALL_RED_MS = 10_000;     // countdown turns red and pulses; stateline warns once
 const ENDPOINT_MS = 900;        // Web Speech: stable interim + this much silence → commit
@@ -705,7 +705,7 @@ const WIDGET_HTML = `
         <header class="head">
             <span class="beacon" aria-hidden="true"></span>
             <span class="title">ALEX_AGENT <span class="dim">// voice link</span></span>
-            <span class="timer" hidden aria-label="Call time remaining">2:00</span>
+            <span class="timer" hidden aria-label="Call time remaining">2:30</span>
             <button class="btn-min" type="button" aria-label="Close voice assistant">▁</button>
         </header>
         <div class="stage">
@@ -713,7 +713,7 @@ const WIDGET_HTML = `
             <div class="stateline">&gt; STANDBY</div>
         </div>
         <div class="start-panel">
-            <p class="consent">Mic activates only during a call.<br>Voice calls are capped at two minutes.</p>
+            <p class="consent">Mic activates only during a call.<br>Voice calls are capped at two and a half minutes.</p>
             <button class="btn-start" type="button">START VOICE LINK</button>
             <button class="btn-text" type="button">TYPE INSTEAD</button>
         </div>
