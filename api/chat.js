@@ -141,9 +141,15 @@ export default async function handler(req, res) {
   }
 
   // Abort the upstream call if the client disconnects or we hit the timeout,
-  // so credits stop burning the moment nobody is listening.
+  // so credits stop burning the moment nobody is listening. The two aborts
+  // must stay distinguishable: a timeout owes the still-connected client an
+  // in-band error, a disconnect owes it nothing.
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), UPSTREAM_TIMEOUT_MS);
+  let timedOut = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, UPSTREAM_TIMEOUT_MS);
   res.on("close", () => controller.abort());
 
   // SSE headers go out before the upstream call; any later failure is
@@ -232,13 +238,19 @@ export default async function handler(req, res) {
     sseWrite(res, { done: true });
     res.end();
   } catch (err) {
-    if (controller.signal.aborted) {
-      // Client went away or timeout fired — end quietly.
+    if (controller.signal.aborted && !timedOut) {
+      // Client went away — end quietly.
       try {
         res.end();
       } catch {
         /* already closed */
       }
+    } else if (timedOut) {
+      // Upstream stalled past the deadline with the client still waiting:
+      // ending here without this event would read as a complete (empty)
+      // answer and the visitor would get silence with no explanation.
+      console.error("chat: upstream timeout");
+      endWithError("upstream_timeout");
     } else {
       console.error(`chat: ${err?.name || "error"}`);
       endWithError("upstream_error");

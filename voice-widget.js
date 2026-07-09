@@ -17,6 +17,11 @@
  *   - Barge-in while the agent speaks requires interim words, sustained mic
  *     RMS, and an echo guard; anything in flight is tagged with an
  *     utteranceId and stale chunks are dropped everywhere.
+ *   - Noise hardening (streets, cafés): endpointing falls back to interim
+ *     stability when ambient RMS never drops, low-confidence engine finals
+ *     are discarded, superseding a pending turn takes real speech (word +
+ *     confidence gates), and tapping the orb while listening force-sends
+ *     the current interim.
  *   - The assistant message kept in history after a barge-in is truncated
  *     to the sentences that actually reached the speaker (frame-counted).
  *   - Sentence-pipelined TTS with an eager first flush, so first audio
@@ -51,16 +56,55 @@ const ENDPOINT_MS = 900;        // Web Speech: stable interim + this much silenc
 const DG_ENDPOINT_MS = 300;     // Deepgram endpointing: silence before speech_final ends a turn
 const DG_FALLBACK_MS = 1800;    // tick safety net when Deepgram never sends speech_final
 const STALE_FINAL_MS = 3000;    // engine finals matching a tick()-committed utterance are dupes this long
-const BARGE_MIN_WORDS = 2;      // interim words that interrupt the agent
+const BARGE_MIN_WORDS = 3;      // interim words that interrupt the agent
 const BARGE_RMS = 0.08;         // sustained mic level that interrupts
 const BARGE_SUSTAIN_MS = 200;   // RMS must stay hot across ticks
+const BARGE_MIN_CONF = 0.6;     // interim confidence needed to barge (when the engine reports one)
+const BARGE_MAX_AGE_MS = 2000;  // interims older than this are leftovers, not an interruption
 const TICK_MS = 120;            // housekeeping cadence (endpointing, barge RMS)
 
+// Ambient-noise gates (streets, cafés). AGC pins the mic RMS high in noise,
+// so silence-based endpointing starves; and background chatter transcribes
+// into real words that would otherwise abort a pending answer.
+const NOISY_EXTRA_MS = 1200;    // stable interim commits even in noise after endpoint window + this
+const COMMIT_MIN_CONF = 0.45;   // engine finals below this confidence are ambient noise, never a turn
+const PENDING_MIN_WORDS = 3;    // words needed for new speech to supersede an in-flight turn
+const PENDING_MIN_CONF = 0.65;  // …and the confidence needed, when the engine reports one
+
+// Short spoken control commands stay interruptions even below the word-count
+// gates: "stop" must always be able to stop the agent (freshness, confidence,
+// echo, and RMS checks still apply). Matched on normalized words.
+const CONTROL_INTENTS = new Set([
+    'stop', 'wait', 'no', 'pause', 'cancel', 'hold on', 'hang on',
+    'one sec', 'one second', 'never mind', 'nevermind', 'stop talking',
+    'be quiet', 'quiet', 'shut up', 'okay stop', 'ok stop', 'no stop',
+    'no wait', 'wait stop', 'stop please', 'please stop', 'wait wait', 'stop stop',
+]);
+function isControlIntent(s) {
+    return CONTROL_INTENTS.has(normalizedWords(s).join(' '));
+}
+
+// Running confidence for a multi-segment utterance: the weakest reported
+// segment speaks for the whole (NaN = still unknown).
+function mergeConf(a, b) {
+    if (!(b > 0)) return a;
+    if (!(a > 0)) return b;
+    return Math.min(a, b);
+}
+
 // Deepgram streaming STT (primary engine when the server mints tokens).
+// utterance_end_ms is Deepgram's WORD-TIMING endpoint: unlike `endpointing`
+// (silence VAD, which background noise starves so speech_final never comes),
+// UtteranceEnd fires on a gap in transcribed words and explicitly ignores
+// non-speech audio like street noise — their documented fix for exactly the
+// "keeps listening in a noisy street" failure. Both run together: endpointing
+// gives snappy turns in quiet rooms, UtteranceEnd ends turns in noise.
+const DG_UTT_END_MS = 1500;
 const STT_TOKEN_URL = '/api/stt-token';
 const DG_LISTEN_URL = 'wss://api.deepgram.com/v1/listen'
     + '?model=nova-3&encoding=linear16&sample_rate=16000&channels=1'
     + '&interim_results=true&endpointing=' + DG_ENDPOINT_MS
+    + '&utterance_end_ms=' + DG_UTT_END_MS
     + '&smart_format=true&punctuate=true';
 const DG_RATE = 16000;          // linear16 rate sent to Deepgram
 const DG_BATCH_MS = 100;        // mic audio batched into ~100 ms frames
@@ -99,9 +143,9 @@ const dbg = {
     bufferedSeconds: 0, overflows: 0,
     sentencesQueued: 0, sentencesSpoken: 0,
     commits: 0, interrupts: 0, recognitionRestarts: 0,
-    rateLimited: 0, errors: 0, utteranceId: 0,
+    rateLimited: 0, errors: 0, utteranceId: 0, noiseDropped: 0,
     sttEngine: null, dgConnects: 0, dgReconnects: 0,
-    dgFrames: 0, dgFinals: 0, dgInterims: 0,
+    dgFrames: 0, dgFinals: 0, dgInterims: 0, dgUttEnds: 0,
 };
 window.__alexvoiceDebug = dbg;
 
@@ -211,6 +255,99 @@ function cleanForTTS(t) {
 
 // Common abbreviations that end with "." but are not sentence boundaries.
 const ABBREV_TAIL = /(?:^|\s)(?:dr|mr|mrs|ms|st|vs|etc|approx|e\.g|i\.e)\.$/i;
+
+// ---------- AGENT TEXT RENDERING ----------
+// Agent bubbles get a display pass that history and TTS never see:
+//   1. spoken-form address slips ("atvora dot com slash sample") fold back
+//      to written form, matching the persona's written-form rule;
+//   2. markdown links, bare domains, URLs, and emails become real anchors,
+//      tappable on the phones where copying text out of a bubble is a chore.
+// Built with createElement/textContent only — reply text never reaches
+// innerHTML, and non-http(s)/mailto targets render as plain text.
+const URL_TLDS = 'io|com|nz|ai|dev|org|net|co';
+const SPOKEN_DOMAIN_RE = new RegExp(
+    '\\b((?:[a-z0-9-]+(?: (?:dash|hyphen) [a-z0-9-]+)* dot )+)(' + URL_TLDS + ')\\b', 'gi');
+// Spoken path chains after a written domain. A chunk is "slash <segment>"
+// (commas tolerated around the connector); a bare ", <segment>" only counts
+// as a path continuation when the segment contains a spoken dash/hyphen —
+// the model uses commas as pauses mid-address ("linkedin.com, slash in,
+// alexrussell dash tech") but ", and let me know" is prose and must stay.
+const SPOKEN_SEG = '[a-z0-9-]+(?: (?:dash|hyphen) [a-z0-9-]+)*';
+const SPOKEN_SEG_DASHED = '[a-z0-9-]+(?: (?:dash|hyphen) [a-z0-9-]+)+';
+const SPOKEN_SLASH_CHUNK = ',? (?:forward )?slash,? ' + SPOKEN_SEG;
+const SPOKEN_PATH_RE = new RegExp(
+    '\\b((?:[a-z0-9-]+\\.)+(?:' + URL_TLDS + '))'
+    + '((?:' + SPOKEN_SLASH_CHUNK + ')(?:' + SPOKEN_SLASH_CHUNK + '|, ' + SPOKEN_SEG_DASHED + ')*)\\b',
+    'gi');
+const BARE_DOMAIN_RE = new RegExp('^(?:[A-Za-z0-9-]+\\.)+(?:' + URL_TLDS + ')(?:\\/[A-Za-z0-9\\-/]*)?$');
+const LINKABLE_RE = new RegExp(
+    '(\\[[^\\]]+\\]\\([^)\\s]+\\)'                              // [label](url)
+    + '|https?:\\/\\/[^\\s)\\]]+'                               // explicit scheme
+    + '|[A-Za-z0-9._%+-]+@(?:[A-Za-z0-9-]+\\.)+[A-Za-z]{2,}'    // email
+    + '|(?:[A-Za-z0-9-]+\\.)+(?:' + URL_TLDS + ')\\b(?:\\/[A-Za-z0-9\\-/]*)?' // bare domain(/path)
+    + ')', 'g');
+const MD_LINK_RE = /^\[([^\]]+)\]\(([^)\s]+)\)$/;
+
+function despokenUrls(t) {
+    return t
+        .replace(SPOKEN_DOMAIN_RE, (m, doms, tld) => doms
+            .replace(/ (?:dash|hyphen) /gi, '-')
+            .replace(/ dot /gi, '.') + tld)
+        .replace(SPOKEN_PATH_RE, (m, dom, tail) => dom + tail
+            .replace(/,? (?:forward )?slash,? /gi, '/')
+            .replace(/, /g, '/')            // comma-continued segments (dash-gated by the match)
+            .replace(/ (?:dash|hyphen) /gi, '-'));
+}
+
+function makeAnchor(href, label) {
+    const a = document.createElement('a');
+    a.href = href;
+    a.target = '_blank';
+    a.rel = 'noopener noreferrer';
+    a.textContent = label;
+    return a;
+}
+
+// href for a matched linkable token, or null when it must stay plain text.
+function hrefFor(token) {
+    if (/^https?:\/\//i.test(token)) return token;
+    if (/^mailto:/i.test(token)) return token;
+    if (token.includes('@') && !token.includes('/')) return 'mailto:' + token;
+    if (BARE_DOMAIN_RE.test(token)) return 'https://' + token;
+    return null;
+}
+
+function renderAgentRich(el, raw) {
+    const text = despokenUrls(raw);
+    el.textContent = '';
+    const parts = text.split(LINKABLE_RE);
+    for (let i = 0; i < parts.length; i++) {
+        let part = parts[i];
+        if (!part) continue;
+        if (i % 2 === 0) {                          // plain text between matches
+            el.appendChild(document.createTextNode(part));
+            continue;
+        }
+        let label = part;
+        const md = part.match(MD_LINK_RE);
+        if (md) { label = md[1]; part = md[2]; }
+        // A scheme URL greedily grabs trailing punctuation ("…alexrussell.io.")
+        // — split it back off so the sentence keeps its period.
+        let tail = '';
+        if (!md) {
+            const tm = part.match(/[.,;:!?]+$/);
+            if (tm) {
+                tail = tm[0];
+                part = part.slice(0, -tail.length);
+                label = part;
+            }
+        }
+        const href = hrefFor(part);
+        if (href) el.appendChild(makeAnchor(href, label));
+        else el.appendChild(document.createTextNode(md ? md[0] : part));
+        if (tail) el.appendChild(document.createTextNode(tail));
+    }
+}
 
 const STATE_LINES = {
     idle: '> STANDBY',
@@ -347,7 +484,8 @@ const WIDGET_CSS = `
         flex-shrink: 0;
     }
     .orb { width: 160px; height: 160px; display: block; }
-    .card[data-state="speaking"] .stage { cursor: pointer; }
+    .card[data-state="speaking"] .stage,
+    .card[data-state="listening"] .stage { cursor: pointer; }
     .stateline {
         margin-top: 2px;
         font-size: 11px;
@@ -439,6 +577,13 @@ const WIDGET_CSS = `
         color: #c9d2cc;
     }
     .m.agent.cut { border-style: dashed; opacity: 0.75; }
+    .m.agent a {
+        color: #9dffb8;
+        text-decoration: underline;
+        text-underline-offset: 2px;
+        word-break: break-all;
+    }
+    .m.agent a:hover { color: #00ff41; }
     .m.user.voice { opacity: 0.7; font-style: italic; }
     .m.interim { opacity: 0.45; font-style: italic; }
     .m.sys {
@@ -627,6 +772,7 @@ class AlexVoiceWidget extends HTMLElement {
         this.recRestartTimer = 0;
         this.interimText = '';
         this.interimAt = 0;
+        this.interimConf = NaN;     // engine confidence for the live interim (NaN = unknown)
         this.interimEl = null;
         this.bargeHits = 0;
 
@@ -639,6 +785,7 @@ class AlexVoiceWidget extends HTMLElement {
         this.dgBatch = [];              // Int16 chunks (ctx rate) awaiting downsample
         this.dgBatchSamples = 0;
         this.dgFinalParts = [];         // is_final segments awaiting speech_final
+        this.dgFinalConf = NaN;         // weakest confidence across those segments
         this.staleFinalText = '';       // tick() committed ahead of the engine:
         this.staleFinalUntil = 0;       // matching finals are dupes until then
         this.pendingVoiceEl = null;     // the turn's placeholder until the agent replies
@@ -713,9 +860,17 @@ class AlexVoiceWidget extends HTMLElement {
             this.field.value = '';
             this.commitUtterance(t);
         });
-        // Tap-to-interrupt on the orb / state line while the agent speaks.
+        // Tap on the orb / state line: interrupt while the agent speaks,
+        // force-send the live interim while listening (noisy environments
+        // can starve the automatic endpointing — this is the manual escape).
         this.card.querySelector('.stage').addEventListener('click', () => {
-            if (this.state === 'speaking') this.interrupt('tap');
+            if (this.state === 'speaking') { this.interrupt('tap'); return; }
+            if (this.state === 'listening' && this.voiceMode && this.interimText) {
+                const t = this.interimText;
+                this.clearInterim();
+                this.armStaleFinalGuard(t);
+                this.commitUtterance(t, true);
+            }
         });
         document.addEventListener('keydown', (e) => {
             if (e.key === 'Escape' && !this.card.hidden) this.collapse();
@@ -763,6 +918,9 @@ class AlexVoiceWidget extends HTMLElement {
         this.statelineEl.classList.remove('notice');
         let line = STATE_LINES[this.state] || '> STANDBY';
         if (this.state === 'listening' && !this.voiceMode) line = '> READY, type below';
+        // Live interim: surface the manual send path — in a noisy street the
+        // auto-endpoint can lag, and the orb tap is the visitor's way out.
+        else if (this.state === 'listening' && this.interimText) line = '> LISTENING… tap orb to send';
         this.statelineEl.textContent = line;
     }
 
@@ -1308,7 +1466,12 @@ class AlexVoiceWidget extends HTMLElement {
 
     maybeBargeIn(text) {
         if (!this.agentAudioActive() || !this.voiceMode || this.micMuted) return;
-        if (wordCount(text) < BARGE_MIN_WORDS) return;
+        if (!isControlIntent(text) && wordCount(text) < BARGE_MIN_WORDS) return;
+        // Noise hardening: a barge interim must be fresh (not a leftover from
+        // before the reply started) and, when the engine reports confidence,
+        // confident — street chatter transcribes low.
+        if (performance.now() - this.interimAt > BARGE_MAX_AGE_MS) return;
+        if (this.interimConf > 0 && this.interimConf < BARGE_MIN_CONF) return;
         if (this.isLikelySelfEcho(text)) return;
         if (this.bargeHits * TICK_MS < BARGE_SUSTAIN_MS) return;
         this.bargeHits = 0;
@@ -1320,11 +1483,18 @@ class AlexVoiceWidget extends HTMLElement {
     onSpeechResult(e) {
         let interim = '';
         let finals = '';
+        let finalConf = NaN;
         const hearingAgentAtStart = this.agentAudioActive();
         for (let i = e.resultIndex; i < e.results.length; i++) {
             const r = e.results[i];
-            if (r.isFinal) finals += r[0].transcript;
-            else interim += r[0].transcript;
+            if (r.isFinal) {
+                finals += r[0].transcript;
+                // Some engines report 0 for "unknown" — keep NaN for those.
+                const c = r[0].confidence;
+                if (typeof c === 'number' && c > 0) finalConf = c;
+            } else {
+                interim += r[0].transcript;
+            }
         }
         interim = interim.trim();
         if (interim) {
@@ -1343,15 +1513,26 @@ class AlexVoiceWidget extends HTMLElement {
                 this.clearInterim();
                 return;
             }
+            if (finalConf > 0 && finalConf < COMMIT_MIN_CONF) {
+                dbg.noiseDropped++;
+                this.clearInterim();
+                return;
+            }
+            if (!this.passesPendingGate(finalText, finalConf)) {
+                dbg.noiseDropped++;
+                this.clearInterim();
+                return;
+            }
             this.commitUtterance(finalText, true);
         }
     }
 
-    setInterim(text) {
+    setInterim(text, conf) {
         if (text !== this.interimText) {
             this.interimText = text;
             this.interimAt = performance.now();
         }
+        this.interimConf = (typeof conf === 'number' && Number.isFinite(conf)) ? conf : NaN;
         // While the turn's placeholder is still awaiting an agent reply, it
         // IS the live indicator: its label flips to "Listening…" instead of
         // stacking a second bubble underneath (clearInterim flips it back).
@@ -1371,7 +1552,9 @@ class AlexVoiceWidget extends HTMLElement {
 
     clearInterim() {
         this.interimText = '';
+        this.interimConf = NaN;
         this.dgFinalParts.length = 0;   // dropping an interim drops its segments too
+        this.dgFinalConf = NaN;
         if (this.pendingVoiceEl && this.pendingVoiceEl.isConnected
             && this.pendingVoiceEl.textContent !== VOICE_MSG_LABEL) {
             this.pendingVoiceEl.textContent = VOICE_MSG_LABEL;
@@ -1643,9 +1826,36 @@ class AlexVoiceWidget extends HTMLElement {
     onDgMessage(raw) {
         let data;
         try { data = JSON.parse(raw); } catch (e) { return; }
-        if (!data || data.type !== 'Results') return;
+        if (!data) return;
+        if (data.type === 'UtteranceEnd') {
+            // Word-timing endpoint: fires even when noise starves the silence
+            // VAD and speech_final never arrives. Commit the finalized
+            // segments; a bare interim stays with the tick() fallback.
+            // last_word_end === -1 marks an utterance that was already
+            // finalized before the gap condition was met (documented dupe).
+            dbg.dgUttEnds++;
+            if (data.last_word_end === -1) return;
+            const full = this.dgFinalParts.join(' ').trim();
+            if (!full) return;
+            const utterConf = this.dgFinalConf;     // weakest segment, pre-reset
+            this.dgFinalParts.length = 0;
+            if (this.agentAudioActive()) { this.clearInterim(); return; }
+            if (this.isStaleFinal(full)) {
+                this.clearStaleFinalGuard();
+                this.clearInterim();
+                return;
+            }
+            this.clearInterim();
+            if (!this.passesPendingGate(full, utterConf)) { dbg.noiseDropped++; return; }
+            // A late speech_final for this same audio is a dupe — swallow it.
+            this.armStaleFinalGuard(full);
+            this.commitUtterance(full, true);
+            return;
+        }
+        if (data.type !== 'Results') return;
         const alt = data.channel && data.channel.alternatives && data.channel.alternatives[0];
         const text = (alt && typeof alt.transcript === 'string') ? alt.transcript.trim() : '';
+        const conf = (alt && typeof alt.confidence === 'number') ? alt.confidence : NaN;
         const hearingAgent = this.agentAudioActive();
 
         if (data.is_final) {
@@ -1655,20 +1865,47 @@ class AlexVoiceWidget extends HTMLElement {
                 // committed; text-matched, so real new speech never lands here.
                 if (data.speech_final) this.clearStaleFinalGuard();
                 this.dgFinalParts.length = 0;
+                this.dgFinalConf = NaN;
                 return;
             }
             if (hearingAgent) {
                 this.clearInterim();    // same echo rule as Web Speech finals
                 return;
             }
-            if (text) this.dgFinalParts.push(text);
+            // Ambient-noise gate: garbled street noise transcribes with low
+            // confidence and must never become (or join) a turn.
+            if (text && conf > 0 && conf < COMMIT_MIN_CONF) {
+                dbg.noiseDropped++;
+                if (data.speech_final) {
+                    this.dgFinalParts.length = 0;
+                    this.clearInterim();
+                }
+                return;
+            }
+            if (text) {
+                this.dgFinalParts.push(text);
+                this.dgFinalConf = mergeConf(this.dgFinalConf, conf);
+            }
             const full = this.dgFinalParts.join(' ').trim();
             if (data.speech_final) {
+                // The utterance's confidence is the weakest of its segments —
+                // captured before clearInterim resets it. The bare `conf` of
+                // an empty endpoint-marker result must not be used here.
+                const utterConf = this.dgFinalConf;
                 this.dgFinalParts.length = 0;
                 this.clearInterim();
-                if (full) this.commitUtterance(full, true);
+                if (!full) return;
+                if (!this.passesPendingGate(full, utterConf)) {
+                    // A turn is in flight and this doesn't look like the
+                    // visitor deliberately speaking over it — committing it
+                    // would abort the pending answer (the "never answers in
+                    // the city" bug).
+                    dbg.noiseDropped++;
+                    return;
+                }
+                this.commitUtterance(full, true);
             } else if (full) {
-                this.setInterim(full);  // segment done, utterance continuing
+                this.setInterim(full, conf);    // segment done, utterance continuing
             }
             return;
         }
@@ -1678,9 +1915,21 @@ class AlexVoiceWidget extends HTMLElement {
         const shown = this.dgFinalParts.length
             ? this.dgFinalParts.join(' ') + ' ' + text
             : text;
-        if (!hearingAgent || !this.isLikelySelfEcho(shown)) this.setInterim(shown);
+        if (!hearingAgent || !this.isLikelySelfEcho(shown)) this.setInterim(shown, conf);
         else this.clearInterim();
         if (hearingAgent) this.maybeBargeIn(shown);
+    }
+
+    // While a turn is in flight (the visitor asked and the answer is being
+    // generated or spoken), a new spoken commit aborts that turn — so it must
+    // look like deliberate speech, not ambient chatter: enough words, and
+    // engine confidence when reported. Quiet-room resumed speech passes; a
+    // passerby's half-heard word does not.
+    passesPendingGate(text, conf) {
+        if (!this.turn) return true;
+        if (conf > 0 && conf < PENDING_MIN_CONF) return false;
+        if (isControlIntent(text)) return true;     // "wait" / "no" must get through
+        return wordCount(text) >= PENDING_MIN_WORDS;
     }
 
     onDgClose() {
@@ -1755,6 +2004,7 @@ class AlexVoiceWidget extends HTMLElement {
         this.dgBatch.length = 0;
         this.dgBatchSamples = 0;
         this.dgFinalParts.length = 0;
+        this.dgFinalConf = NaN;
     }
 
     // ================= CONVERSATION LOOP =================
@@ -1793,6 +2043,7 @@ class AlexVoiceWidget extends HTMLElement {
         this.turn = {
             id, reply: '', pending: '', sentences: [],
             chatDone: false, flushed: false, canned: false, el: null,
+            ttsFailed: false,
         };
         this.resetPlayback();
         this.setState('thinking');
@@ -1809,6 +2060,7 @@ class AlexVoiceWidget extends HTMLElement {
         this.turn = {
             id, reply: text, pending: '', sentences: [],
             chatDone: true, flushed: true, canned: true, el: null,
+            ttsFailed: false,
         };
         this.resetPlayback();
         this.queueSentence(this.turn, text);
@@ -1896,7 +2148,7 @@ class AlexVoiceWidget extends HTMLElement {
         turn.reply += d;
         turn.pending += d;
         if (!turn.el) turn.el = this.addMsg('agent', '');
-        turn.el.textContent = turn.reply;
+        renderAgentRich(turn.el, turn.reply);
         this.scrollTranscript();
         this.splitPending(turn, false);
     }
@@ -1974,6 +2226,7 @@ class AlexVoiceWidget extends HTMLElement {
                         this.ttsQueue.length = 0;       // don't hammer the limiter
                     } else if (e && e.name !== 'AbortError') {
                         dbg.errors++;
+                        job.turn.ttsFailed = true;
                     }
                 }
                 rec.endFrame = this.framesScheduled;
@@ -1988,7 +2241,15 @@ class AlexVoiceWidget extends HTMLElement {
         dbg.ttsRequests++;
         const ctrl = new AbortController();
         this.ttsCtrl = ctrl;
-        const watchdog = setTimeout(() => { try { ctrl.abort(); } catch (e) { /* ignore */ } }, 30000);
+        // Sits above the server's 30s upstream timeout so a stall surfaces
+        // as its clean 504 first; if this local abort fires on the still-
+        // current turn it must read as a TTS failure, not as the benign
+        // interrupt/stale abort that AbortError normally means here.
+        let watchdogFired = false;
+        const watchdog = setTimeout(() => {
+            watchdogFired = true;
+            try { ctrl.abort(); } catch (e) { /* ignore */ }
+        }, 35000);
         try {
             const res = await fetch(TTS_URL, {
                 method: 'POST',
@@ -2030,6 +2291,13 @@ class AlexVoiceWidget extends HTMLElement {
                     this.setState('speaking');
                 }
             }
+        } catch (e) {
+            if (watchdogFired && uid === this.utteranceId) {
+                const err = new Error('tts_watchdog_timeout');
+                err.ttsTimeout = true;
+                throw err;        // not an AbortError → pumpTTS marks ttsFailed
+            }
+            throw e;
         } finally {
             clearTimeout(watchdog);
             if (this.ttsCtrl === ctrl) this.ttsCtrl = null;
@@ -2063,6 +2331,16 @@ class AlexVoiceWidget extends HTMLElement {
         if (!t.canned && t.reply.trim()) {
             this.history.push({ role: 'assistant', content: t.reply.trim().slice(0, MSG_MAX) });
             this.trimHistory();
+        }
+        // A reply that produced no audio at all (TTS died on every sentence)
+        // must not fail silently — the visitor was waiting to HEAR it.
+        if (t.ttsFailed && !t.canned && this.playerNode && this.framesScheduled === 0 && t.reply.trim()) {
+            this.sysMsg('voice output hiccuped; the reply above is text only.');
+        }
+        // A turn that finished with no text at all (upstream stall or empty
+        // stream) must not just melt back into LISTENING as if answered.
+        if (!t.canned && !t.reply.trim()) {
+            this.sysMsg('no answer came back, try asking again.');
         }
         if (this.callActive) {
             if (wasSpeaking) this.restartRecognition();
@@ -2175,7 +2453,8 @@ class AlexVoiceWidget extends HTMLElement {
         }
         const el = document.createElement('div');
         el.className = 'm ' + kind;
-        el.textContent = text;
+        if (kind === 'agent') renderAgentRich(el, text);
+        else el.textContent = text;
         // Keep the interim bubble pinned to the bottom.
         if (this.interimEl) this.transcriptEl.insertBefore(el, this.interimEl);
         else this.transcriptEl.appendChild(el);
@@ -2214,15 +2493,26 @@ class AlexVoiceWidget extends HTMLElement {
         // interim + ~900 ms of silence commits the utterance. On the Deepgram
         // engine the window must sit safely ABOVE Deepgram's own endpointing,
         // or the two race and one utterance commits twice (two bubbles).
-        const endpointMs = this.sttEngine === 'deepgram' ? DG_FALLBACK_MS : ENDPOINT_MS;
+        //
+        // Noise fallback: in a street or café the AGC-boosted ambient RMS
+        // never drops below the silence threshold, and Deepgram's own
+        // endpointing starves for the same reason — so a question could sit
+        // uncommitted forever ("it just keeps listening"). If the interim has
+        // stopped GROWING for long enough, the visitor has stopped talking,
+        // whatever the level meter claims: commit anyway.
         if (this.voiceMode && this.interimText && this.state === 'listening'
-            && now - this.interimAt > endpointMs && this.micRms() < 0.05) {
-            const t = this.interimText;
-            this.clearInterim();
-            // The engine never endpointed this utterance itself, so a late
-            // final for it (if one ever arrives) is a duplicate — swallow it.
-            this.armStaleFinalGuard(t);
-            this.commitUtterance(t, true);
+            && !(this.interimConf > 0 && this.interimConf < COMMIT_MIN_CONF)) {
+            const endpointMs = this.sttEngine === 'deepgram' ? DG_FALLBACK_MS : ENDPOINT_MS;
+            const stableFor = now - this.interimAt;
+            if ((stableFor > endpointMs && this.micRms() < 0.05)
+                || stableFor > endpointMs + NOISY_EXTRA_MS) {
+                const t = this.interimText;
+                this.clearInterim();
+                // The engine never endpointed this utterance itself, so a late
+                // final for it (if one ever arrives) is a duplicate — swallow it.
+                this.armStaleFinalGuard(t);
+                this.commitUtterance(t, true);
+            }
         }
 
         // Barge-in requires both sustained input energy and a non-echo interim.
@@ -2510,6 +2800,10 @@ class AlexVoiceWidget extends HTMLElement {
 }
 
 // ---------- MOUNT ----------
+// The hero-chat client (script.js) upgrades its finished answers with the
+// same renderer, so addresses read and tap identically in both surfaces.
+window.__alexvoiceRichText = renderAgentRich;
+
 function mount() {
     if (!window.customElements || document.querySelector('alex-voice-widget')) return;
     if (!customElements.get('alex-voice-widget')) {

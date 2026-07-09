@@ -31,14 +31,16 @@ export function sanitizeText(raw) {
   return raw
     .replace(/[*_#`~]/g, "")
     // Speech-normalize contacts: the persona writes them with real symbols
-    // (me@alexrussell.io) so transcripts look right; audio needs the words.
-    // Emails first (their domain loses its dots here, so the domain rule
-    // below cannot double-process them).
+    // (me@alexrussell.io) so transcripts look right; audio needs the words —
+    // including "dash" for hyphens, or alexrussell-tech reads as two words
+    // with a silent, unwriteable gap. Emails first (their domain loses its
+    // dots here, so the domain rule below cannot double-process them).
     .replace(/([A-Za-z0-9._%+-]+)@((?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,})/g,
-      (m, user, dom) => user + " at " + dom.replace(/\./g, " dot "))
+      (m, user, dom) => user.replace(/-/g, " dash ") + " at " +
+        dom.replace(/\./g, " dot ").replace(/-/g, " dash "))
     .replace(/\b((?:[A-Za-z0-9-]+\.)+(?:io|com|nz|ai|dev|org|net|co))\b(\/[A-Za-z0-9\-/]*)?/g,
-      (m, dom, path) => dom.replace(/\./g, " dot ") +
-        (path ? " slash " + path.slice(1).replace(/\//g, " slash ") : ""))
+      (m, dom, path) => dom.replace(/\./g, " dot ").replace(/-/g, " dash ") +
+        (path ? " slash " + path.slice(1).replace(/\//g, " slash ").replace(/-/g, " dash ") : ""))
     .replace(/\s*[–—]+\s*/g, ", ") // persona forbids dashes; belt and braces
     .replace(/[\u0000-\u001f\u007f]/g, " ")
     .replace(/\s+/g, " ")
@@ -72,9 +74,16 @@ export default async function handler(req, res) {
     return;
   }
 
-  // Abort upstream on client disconnect or timeout to save credits.
+  // Abort upstream on client disconnect or timeout to save credits. Keep the
+  // two distinguishable: a timeout before any audio owes the still-connected
+  // client a real error status (a bare 200 with no body would read as a
+  // successful, silent reply and the widget would never flag it).
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), UPSTREAM_TIMEOUT_MS);
+  let timedOut = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, UPSTREAM_TIMEOUT_MS);
   res.on("close", () => controller.abort());
 
   let audioStarted = false;
@@ -204,9 +213,16 @@ export default async function handler(req, res) {
       try {
         outcome = await attempt(keys[k], keyTag, lastKey);
       } catch (err) {
+        if (timedOut && !audioStarted) {
+          // Upstream stalled before producing any audio; the client is
+          // still waiting and must see a failure, not an empty success.
+          console.error(`tts: upstream timeout (${keyTag})`);
+          failBeforeAudio(504, "upstream_timeout");
+          return;
+        }
         if (controller.signal.aborted || audioStarted) {
-          // Client gone, timeout fired, or the stream broke mid-audio:
-          // nothing useful left to send.
+          // Client gone, or the stream broke mid-audio: nothing useful
+          // left to send.
           try {
             res.end();
           } catch {

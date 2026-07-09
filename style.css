@@ -636,3 +636,14 @@ h2::before { content: "> "; color: var(--terminal-green); }
 @keyframes btn-spin {
     to { transform: rotate(360deg); }
 }
+
+/* Links inside hero-chat agent answers (upgraded once a reply finishes). */
+.agent-answer a {
+    color: #86efac;
+    text-decoration: underline;
+    text-underline-offset: 2px;
+    word-break: break-all;
+}
+.agent-answer a:hover {
+    color: #4ade80;
+}

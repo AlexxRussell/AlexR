@@ -300,11 +300,16 @@ async function askAlex(question) {
     let reply = '';
     let typer = null;
     let failText = 'link hiccup, try again in a moment.';
+    // Watchdog: a stalled mobile connection would otherwise leave read()
+    // hanging forever with the input locked (busy never clears).
+    const ctrl = new AbortController();
+    const watchdog = setTimeout(() => ctrl.abort(), 60000);
     try {
         const res = await fetch('/api/chat', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ messages: alexChat.history.slice(-14) }),
+            signal: ctrl.signal,
         });
         if (!res.ok || !res.body) {
             if (res.status === 429) failText = 'rate limited, give it a beat and try again.';
@@ -340,13 +345,22 @@ async function askAlex(question) {
         }
         if (!reply) throw new Error('empty');
         await typer.finish(); // let the last characters land before unlocking
+        // Once complete, upgrade addresses/links in the answer to anchors
+        // (renderer shared from the voice widget; plain text if absent).
+        if (window.__alexvoiceRichText) window.__alexvoiceRichText(answerSpan, reply);
         alexChat.history.push({ role: 'assistant', content: reply });
     } catch (err) {
         loaderEl.remove();
         if (!aEl.parentNode) historyEl.appendChild(aEl);
         if (reply) {
-            // keep what was heard mid-stream, shown in full
+            // keep what was heard mid-stream, shown in full — but say it was
+            // cut, or a half answer reads as a complete (wrong) one.
             if (typer) typer.cancel();
+            if (window.__alexvoiceRichText) window.__alexvoiceRichText(answerSpan, reply);
+            const note = document.createElement('span');
+            note.className = 'text-gray-600';
+            note.textContent = ' [link dropped, answer cut short]';
+            aEl.appendChild(note);
             alexChat.history.push({ role: 'assistant', content: reply });
         } else {
             if (typer) typer.cancel('');
@@ -354,6 +368,7 @@ async function askAlex(question) {
             answerSpan.textContent = failText;
         }
     } finally {
+        clearTimeout(watchdog);
         const cursor = aEl.querySelector('.terminal-cursor');
         if (cursor) cursor.remove();
         historyEl.scrollTop = historyEl.scrollHeight;
