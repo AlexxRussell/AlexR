@@ -372,6 +372,38 @@ const check = (name, ok, extra) => {
     uttEndGate.before.turn && uttEndGate.id === uttEndGate.before.id && uttEndGate.turn,
     JSON.stringify(uttEndGate));
 
+  // >> with an empty field sends the live interim (twin of the orb tap).
+  const btnSend = await page.evaluate(() => {
+    const el = document.querySelector('alex-voice-widget');
+    el.interrupt('test');
+    el.setInterim('send via button', 0.9);
+    el.field.value = '';
+    el.shadowRoot.querySelector('.inputrow')
+      .dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
+    return {
+      sent: el.history[el.history.length - 1].content === 'send via button',
+      thinking: el.state === 'thinking',
+    };
+  });
+  check('>> with empty field sends the live interim', btnSend.sent && btnSend.thinking,
+    JSON.stringify(btnSend));
+
+  // Repeated noise drops nudge the visitor toward typing, once per call.
+  const nudge = await page.evaluate(() => {
+    const el = document.querySelector('alex-voice-widget');
+    el.callNoiseDrops = 0;
+    el.noiseNudgeShown = false;
+    el.noteNoiseDrop();
+    el.noteNoiseDrop();
+    el.noteNoiseDrop();
+    el.noteNoiseDrop();
+    const msgs = [...el.shadowRoot.querySelectorAll('.m.sys')]
+      .filter((m) => m.textContent.includes('typing works too'));
+    return { shown: msgs.length >= 1, once: el.noiseNudgeShown };
+  });
+  check('noise nudge appears after repeated drops (once)', nudge.shown && nudge.once,
+    JSON.stringify(nudge));
+
   await browser.close();
   srv.close();
   console.log(fails ? `\n${fails} FAILURES` : '\nALL CHECKS PASSED');

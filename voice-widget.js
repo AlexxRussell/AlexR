@@ -816,6 +816,10 @@ class AlexVoiceWidget extends HTMLElement {
         this.wakeLockPending = false;   // a request() is in flight
         this.callGen = 0;               // bumped on teardown: cancels in-flight startCall
         this.tickTimer = 0;
+        this.statsBase = null;          // dbg snapshot at call start (telemetry deltas)
+        this.callStartedAt = 0;
+        this.callNoiseDrops = 0;        // gate-dropped results this call (noise nudge)
+        this.noiseNudgeShown = false;
 
         const root = this.attachShadow({ mode: 'open' });
         const style = document.createElement('style');
@@ -856,9 +860,19 @@ class AlexVoiceWidget extends HTMLElement {
         this.inputRow.addEventListener('submit', (e) => {
             e.preventDefault();
             const t = this.field.value.trim();
-            if (!t) return;
-            this.field.value = '';
-            this.commitUtterance(t);
+            if (t) {
+                this.field.value = '';
+                this.commitUtterance(t);
+                return;
+            }
+            // Empty field + live interim: >> doubles as "send what you
+            // heard" — the discoverable twin of the orb tap.
+            if (this.voiceMode && this.interimText && this.state === 'listening') {
+                const heard = this.interimText;
+                this.clearInterim();
+                this.armStaleFinalGuard(heard);
+                this.commitUtterance(heard, true);
+            }
         });
         // Tap on the orb / state line: interrupt while the agent speaks,
         // force-send the live interim while listening (noisy environments
@@ -884,6 +898,10 @@ class AlexVoiceWidget extends HTMLElement {
             }
         });
         window.addEventListener('pointerdown', () => this.resumeAudio(), { passive: true });
+        // Tab closed mid-call: endCall never runs, so beacon from here.
+        window.addEventListener('pagehide', () => {
+            if (this.callActive) this.sendCallBeacon('pagehide');
+        });
 
         if (!SR_CTOR) {
             // Firefox etc: no Web Speech — text is the only input path.
@@ -949,7 +967,7 @@ class AlexVoiceWidget extends HTMLElement {
     collapse() {
         // The mic promise is "only during a call" — a hidden card never keeps
         // a hot mic, so collapsing ends the call.
-        this.endCall();
+        this.endCall('collapse');
         this.card.hidden = true;
         this.launcher.hidden = false;
     }
@@ -1023,6 +1041,16 @@ class AlexVoiceWidget extends HTMLElement {
         dbg.mode = voice ? 'voice' : 'text';
         this.micBtn.hidden = !voice;
         this.callActive = true;
+        this.callStartedAt = performance.now();
+        this.callNoiseDrops = 0;
+        this.noiseNudgeShown = false;
+        this.statsBase = {
+            commits: dbg.commits, interrupts: dbg.interrupts,
+            noiseDropped: dbg.noiseDropped, dgUttEnds: dbg.dgUttEnds,
+            dgFinals: dbg.dgFinals, errors: dbg.errors,
+            rateLimited: dbg.rateLimited, ttsRequests: dbg.ttsRequests,
+            sentencesSpoken: dbg.sentencesSpoken, chatChars: dbg.chatChars,
+        };
         this.acquireWakeLock();
         // voice calls are capped: the countdown keeps it fair and visible
         this.callDeadline = voice ? performance.now() + CALL_MAX_MS : 0;
@@ -1047,12 +1075,13 @@ class AlexVoiceWidget extends HTMLElement {
         this.field.focus();
     }
 
-    endCall() {
+    endCall(reason) {
         this.callGen++;     // cancels any startCall still awaiting setup
         if (!this.callActive) return;
         if (this.turn) this.interrupt('end');
         this.callActive = false;
         this.callDeadline = 0;
+        this.sendCallBeacon(reason || 'end');
         this.releaseWakeLock();
         this.timerEl.hidden = true;
         this.stopTick();
@@ -1086,6 +1115,47 @@ class AlexVoiceWidget extends HTMLElement {
             try { this.ctx.suspend().catch(() => {}); } catch (e) { /* ignore */ }
         }
         this.setState('idle');
+    }
+
+    // Counters-only telemetry when a call ends: field incidents outlive the
+    // runtime-log retention window unless the client reports them itself.
+    // No message text ever leaves the page — deltas of the dbg counters,
+    // the mode, and how the call ended.
+    sendCallBeacon(reason) {
+        if (!this.statsBase) return;
+        const b = this.statsBase;
+        this.statsBase = null;      // one beacon per call (pagehide vs endCall)
+        const payload = {
+            mode: dbg.mode || 'text',
+            reason: reason || 'end',
+            sttEngine: dbg.sttEngine || 'none',
+            secs: Math.round((performance.now() - this.callStartedAt) / 1000),
+            commits: dbg.commits - b.commits,
+            interrupts: dbg.interrupts - b.interrupts,
+            noiseDropped: dbg.noiseDropped - b.noiseDropped,
+            dgUttEnds: dbg.dgUttEnds - b.dgUttEnds,
+            dgFinals: dbg.dgFinals - b.dgFinals,
+            errors: dbg.errors - b.errors,
+            rateLimited: dbg.rateLimited - b.rateLimited,
+            ttsRequests: dbg.ttsRequests - b.ttsRequests,
+            sentencesSpoken: dbg.sentencesSpoken - b.sentencesSpoken,
+            chatChars: dbg.chatChars - b.chatChars,
+        };
+        const json = JSON.stringify(payload);
+        try {
+            if (navigator.sendBeacon
+                && navigator.sendBeacon('/api/log', new Blob([json], { type: 'application/json' }))) {
+                return;
+            }
+        } catch (e) { /* fall through to fetch */ }
+        try {
+            fetch('/api/log', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: json,
+                keepalive: true,
+            }).catch(() => {});
+        } catch (e) { /* telemetry must never break the page */ }
     }
 
     // Screen wake lock: a call is a hands-off experience (especially voice),
@@ -1514,12 +1584,12 @@ class AlexVoiceWidget extends HTMLElement {
                 return;
             }
             if (finalConf > 0 && finalConf < COMMIT_MIN_CONF) {
-                dbg.noiseDropped++;
+                this.noteNoiseDrop();
                 this.clearInterim();
                 return;
             }
             if (!this.passesPendingGate(finalText, finalConf)) {
-                dbg.noiseDropped++;
+                this.noteNoiseDrop();
                 this.clearInterim();
                 return;
             }
@@ -1846,7 +1916,7 @@ class AlexVoiceWidget extends HTMLElement {
                 return;
             }
             this.clearInterim();
-            if (!this.passesPendingGate(full, utterConf)) { dbg.noiseDropped++; return; }
+            if (!this.passesPendingGate(full, utterConf)) { this.noteNoiseDrop(); return; }
             // A late speech_final for this same audio is a dupe — swallow it.
             this.armStaleFinalGuard(full);
             this.commitUtterance(full, true);
@@ -1875,7 +1945,7 @@ class AlexVoiceWidget extends HTMLElement {
             // Ambient-noise gate: garbled street noise transcribes with low
             // confidence and must never become (or join) a turn.
             if (text && conf > 0 && conf < COMMIT_MIN_CONF) {
-                dbg.noiseDropped++;
+                this.noteNoiseDrop();
                 if (data.speech_final) {
                     this.dgFinalParts.length = 0;
                     this.clearInterim();
@@ -1900,7 +1970,7 @@ class AlexVoiceWidget extends HTMLElement {
                     // visitor deliberately speaking over it — committing it
                     // would abort the pending answer (the "never answers in
                     // the city" bug).
-                    dbg.noiseDropped++;
+                    this.noteNoiseDrop();
                     return;
                 }
                 this.commitUtterance(full, true);
@@ -1930,6 +2000,19 @@ class AlexVoiceWidget extends HTMLElement {
         if (conf > 0 && conf < PENDING_MIN_CONF) return false;
         if (isControlIntent(text)) return true;     // "wait" / "no" must get through
         return wordCount(text) >= PENDING_MIN_WORDS;
+    }
+
+    // Every gate-dropped result lands here. When one call keeps hitting the
+    // gates, point at the keyboard once instead of letting the visitor fight
+    // the street for the mic.
+    noteNoiseDrop() {
+        dbg.noiseDropped++;
+        this.callNoiseDrops++;
+        if (this.callNoiseDrops >= 3 && !this.noiseNudgeShown
+            && this.callActive && this.voiceMode) {
+            this.noiseNudgeShown = true;
+            this.sysMsg('loud out there? typing works too, replies are still spoken.');
+        }
     }
 
     onDgClose() {
@@ -2079,7 +2162,7 @@ class AlexVoiceWidget extends HTMLElement {
         this.updateBufferedDebug();
     }
 
-    async runChat(turn) {
+    async runChat(turn, attempt) {
         dbg.chatRequests++;
         const ctrl = new AbortController();
         this.chatCtrl = ctrl;
@@ -2094,13 +2177,16 @@ class AlexVoiceWidget extends HTMLElement {
             });
         } catch (e) {
             clearTimeout(watchdog);
-            if (turn.id === this.utteranceId) this.turnError('connection hiccup, try again in a moment.');
+            if (turn.id !== this.utteranceId) return;
+            if (!attempt) { this.retryChat(turn); return; }
+            this.turnError('connection hiccup, try again in a moment.');
             return;
         }
         if (turn.id !== this.utteranceId) { clearTimeout(watchdog); return; }
         if (res.status === 429) { clearTimeout(watchdog); this.rateLimitedTurn(); return; }
         if (!res.ok || !res.body) {
             clearTimeout(watchdog);
+            if (!attempt && res.status >= 500) { this.retryChat(turn); return; }
             this.turnError('the agent glitched, try again.');
             return;
         }
@@ -2127,6 +2213,7 @@ class AlexVoiceWidget extends HTMLElement {
                         } else if (ev.done) {
                             this.onChatDone(turn);
                         } else if (ev.error) {
+                            if (!attempt && !turn.reply) { this.retryChat(turn); return; }
                             this.turnError('the agent glitched, try again.');
                             return;
                         }
@@ -2135,11 +2222,22 @@ class AlexVoiceWidget extends HTMLElement {
             }
             if (turn.id === this.utteranceId && !turn.chatDone) this.onChatDone(turn);
         } catch (e) {
-            if (turn.id === this.utteranceId) this.turnError('connection dropped, try again.');
+            if (turn.id === this.utteranceId) {
+                if (!attempt && !turn.reply) { this.retryChat(turn); return; }
+                this.turnError('connection dropped, try again.');
+            }
         } finally {
             clearTimeout(watchdog);
             if (this.chatCtrl === ctrl) this.chatCtrl = null;
         }
+    }
+
+    // One silent retry absorbs a cellular blip — but only when nothing has
+    // streamed yet, so a half-delivered answer never restarts on the visitor.
+    retryChat(turn) {
+        setTimeout(() => {
+            if (turn.id === this.utteranceId && this.callActive) this.runChat(turn, 1);
+        }, 350);
     }
 
     onDelta(turn, d) {
@@ -2540,7 +2638,7 @@ class AlexVoiceWidget extends HTMLElement {
         const left = this.callDeadline - performance.now();
         if (left <= 0) {
             this.sysMsg("time's up, thanks for the chat! start another call anytime.");
-            this.endCall();
+            this.endCall('timeup');
             // The idle start screen hides the transcript, so the sys message
             // alone would be invisible — say it on the stateline too.
             this.noticeFor("time's up, thanks for the chat", 8000);

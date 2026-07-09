@@ -198,7 +198,10 @@ export function globalBudget(res, key, limit, windowMs) {
 /**
  * Parse the request body as JSON with a hard size cap.
  * Returns the parsed value, or null after having written an error
- * response (413 too large, 400 invalid JSON).
+ * response (413 too large, 400 invalid JSON). A literal JSON `null`
+ * body is rejected as invalid here — otherwise the return value would
+ * be indistinguishable from "error already sent" and the caller would
+ * return without ever writing a response (hung invocation).
  *
  * Works both with the raw Node request stream and with runtimes that
  * pre-buffer the body onto req.body (Vercel's Node helpers do this).
@@ -214,12 +217,18 @@ export async function readJson(req, res, maxBytes) {
       return null;
     }
     if (typeof req.body === "string") {
+      let parsed;
       try {
-        return JSON.parse(req.body);
+        parsed = JSON.parse(req.body);
       } catch {
         sendJson(res, 400, { error: "invalid_json" });
         return null;
       }
+      if (parsed === null) {
+        sendJson(res, 400, { error: "invalid_json" });
+        return null;
+      }
+      return parsed;
     }
     return req.body;
   }
@@ -247,10 +256,16 @@ export async function readJson(req, res, maxBytes) {
     return null;
   }
 
+  let parsed;
   try {
-    return JSON.parse(Buffer.concat(chunks).toString("utf8"));
+    parsed = JSON.parse(Buffer.concat(chunks).toString("utf8"));
   } catch {
     sendJson(res, 400, { error: "invalid_json" });
     return null;
   }
+  if (parsed === null) {
+    sendJson(res, 400, { error: "invalid_json" });
+    return null;
+  }
+  return parsed;
 }

@@ -179,7 +179,12 @@ export default async function handler(req, res) {
         messages: [{ role: "system", content: SYSTEM_PROMPT }, ...messages],
         stream: true,
         temperature: 0.8,
-        max_completion_tokens: 240,
+        // M2.7 interleaves hidden <think> reasoning in content and it spends
+        // from THIS budget. 240 caused occasional mid-sentence truncation
+        // (long think -> few tokens left for the visible answer, stream ends
+        // cleanly at finish_reason=length). The persona keeps visible answers
+        // short; the headroom is for the thinking.
+        max_completion_tokens: 2048,
       }),
     });
 
@@ -191,6 +196,7 @@ export default async function handler(req, res) {
 
     const filter = new ThinkFilter();
     let started = false; // set once real (non-whitespace) text has been sent
+    let finishReason = null;
     const decoder = new TextDecoder();
     let sseBuf = "";
 
@@ -218,6 +224,8 @@ export default async function handler(req, res) {
           endWithError("upstream_error");
           return;
         }
+        const fr = event?.choices?.[0]?.finish_reason;
+        if (typeof fr === "string" && fr.length > 0) finishReason = fr;
         const delta = event?.choices?.[0]?.delta?.content;
         if (typeof delta === "string" && delta.length > 0) {
           let visible = deDash(filter.push(delta));
@@ -235,6 +243,11 @@ export default async function handler(req, res) {
     let tail = deDash(filter.flush());
     if (!started) tail = tail.replace(/^\s+/, "");
     if (tail.length > 0) sseWrite(res, { d: tail });
+    // A non-"stop" finish must never hide again: "length" means the visible
+    // answer was truncated by the token budget (the mid-sentence-cutoff bug).
+    if (finishReason && finishReason !== "stop") {
+      console.warn(`chat: finish_reason=${finishReason}`);
+    }
     sseWrite(res, { done: true });
     res.end();
   } catch (err) {
