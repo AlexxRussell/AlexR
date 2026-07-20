@@ -315,6 +315,14 @@ const check = (name, ok, extra) => {
       // term, or the eager flush never fires and the case proves nothing.
       course: stream(['Alexander really finished the whole introductory computer science course known online as CS50',
         "'s track."]),
+      // The digit may not have streamed yet, so the token has to be held on
+      // shape alone: these deltas break before the first digit of each term.
+      ga4: stream(['Alexander really finished the whole introductory computer science course and analytics work on GA',
+        '4 today.']),
+      n8n: stream(['Alexander really finished the whole introductory computer science course and automation work on n',
+        '8n today.']),
+      grade: stream(['Alexander really finished the whole introductory computer science course and earned a grade A',
+        '+ today.']),
       clause: stream(['Alexander builds agentic systems, and he ships them fast in days.']),
       big: stream(['That pipeline processed 1,', '250,000 records last year without a hitch.']),
     };
@@ -336,6 +344,12 @@ const check = (name, ok, extra) => {
   check('alphanumeric term intact across deltas',
     split.course.some((c) => c.includes("CS50's")) && !split.course.some((c) => /^\d/.test(c.trim())),
     JSON.stringify(split.course));
+  check('term intact when a delta breaks before its digit', intact(split.ga4, 'GA4'),
+    JSON.stringify(split.ga4));
+  check('leading-letter term intact across deltas', intact(split.n8n, 'n8n'),
+    JSON.stringify(split.n8n));
+  check('grade intact when a delta breaks before its plus', intact(split.grade, 'A+'),
+    JSON.stringify(split.grade));
   // The latency feature itself must still work.
   check('eager comma flush still fires on a real clause comma',
     split.clause[0] === 'Alexander builds agentic systems,', JSON.stringify(split.clause));

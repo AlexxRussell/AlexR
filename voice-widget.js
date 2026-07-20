@@ -238,12 +238,15 @@ function wordCount(s) {
 // next delta ("$2" + ",950"), and any early chunk boundary inside a number
 // reaches TTS as two separate wrong numbers. Returns how much of the buffer is
 // safe to flush before the stream ends.
-// Holds the whole trailing token, not just its digits: "CS50" and "n8n" are
-// real knowledge-base terms and must not be cut into "CS" + "50", and a
-// leading "$", "-" or "." belongs to the number that follows it.
+// Holds back the whole trailing token, whatever it looks like. Testing it for
+// a digit was not enough: the digit may not have streamed yet, so "GA" + "4"
+// and "n" + "8n" still split. Nothing about a partial token is knowable until
+// whitespace follows it, and a half token is wrong for prose as much as for
+// numbers ("integratio" then "n"), so the eager flush simply never reaches
+// past the last completed one.
 function safeFlushEnd(s) {
     const m = /\S+$/.exec(s);
-    return m && /[\d$]/.test(m[0]) ? m.index : s.length;
+    return m ? m.index : s.length;
 }
 
 function normalizedWords(s) {
