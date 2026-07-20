@@ -233,6 +233,19 @@ function wordCount(s) {
     return s.trim().split(/\s+/).filter(Boolean).length;
 }
 
+// A number is only known-complete once a non-number character follows it. While
+// a reply is still streaming, a trailing numeric token may be continued by the
+// next delta ("$2" + ",950"), and any early chunk boundary inside a number
+// reaches TTS as two separate wrong numbers. Returns how much of the buffer is
+// safe to flush before the stream ends.
+// Holds the whole trailing token, not just its digits: "CS50" and "n8n" are
+// real knowledge-base terms and must not be cut into "CS" + "50", and a
+// leading "$", "-" or "." belongs to the number that follows it.
+function safeFlushEnd(s) {
+    const m = /\S+$/.exec(s);
+    return m && /[\d$]/.test(m[0]) ? m.index : s.length;
+}
+
 function normalizedWords(s) {
     return s
         .toLowerCase()
@@ -2272,13 +2285,22 @@ class AlexVoiceWidget extends HTMLElement {
         if (consumed) turn.pending = turn.pending.slice(consumed);
 
         if (!turn.flushed && !flushAll) {
-            // Eager first flush: ~12 words, or the first comma clause.
-            const trimmed = turn.pending.trim();
+            // Eager first flush: ~12 words, or the first comma clause. Both cut
+            // mid-stream, so neither may reach past safeFlushEnd: a delta
+            // ending "$2" or "$2," would otherwise be spoken as its own number
+            // and the rest ("950") as another.
+            const safeEnd = safeFlushEnd(turn.pending);
+            const safe = turn.pending.slice(0, safeEnd);
+            const trimmed = safe.trim();
             if (wordCount(trimmed) >= 12) {
                 this.queueSentence(turn, trimmed);
-                turn.pending = '';
+                turn.pending = turn.pending.slice(safeEnd);
             } else {
-                const ci = turn.pending.indexOf(',');
+                // Clause comma only. A thousands separator must never end a
+                // chunk: "$2,950" split there reaches TTS as "$2," and "950",
+                // and speaks as "two dollars" then "nine hundred fifty".
+                const cm = /,(?!\d)/.exec(safe);
+                const ci = cm ? cm.index : -1;
                 if (ci > 10) {
                     this.queueSentence(turn, turn.pending.slice(0, ci + 1).trim());
                     turn.pending = turn.pending.slice(ci + 1);

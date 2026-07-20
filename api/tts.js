@@ -19,16 +19,107 @@
 
 import { MINIMAX_BASE, checkAccess, globalBudget, rateLimit, readJson, sendJson } from "./_lib.js";
 
-const MAX_TEXT_CHARS = 800;
+const MAX_TEXT_CHARS = 800;      // client contract, measured on the raw text
+// Headroom for digits expanding into words, sized just under MiniMax's 10,000
+// limit. The raw contract above is the real gate; this only stops an absurd
+// payload reaching upstream, so it is deliberately loose — a reply that merely
+// quotes several prices must never be rejected here and go silent.
+const MAX_SPOKEN_CHARS = 9500;
 const BODY_CAP_BYTES = 8 * 1024;
 const UPSTREAM_TIMEOUT_MS = 30_000;
+
+// ---- Number speech normalization ------------------------------------------
+// The persona writes numbers as digits so transcripts read like a pricing page
+// ($2,950, 71%, 5 working days); speech needs the words. The reading depends on
+// the kind of number: money and counts are cardinals, but a bare four-digit
+// year is said in pairs ("twenty twenty six", never "two thousand twenty six").
+const ONES = [
+  "zero", "one", "two", "three", "four", "five", "six", "seven", "eight",
+  "nine", "ten", "eleven", "twelve", "thirteen", "fourteen", "fifteen",
+  "sixteen", "seventeen", "eighteen", "nineteen",
+];
+const TENS = ["", "", "twenty", "thirty", "forty", "fifty", "sixty", "seventy", "eighty", "ninety"];
+
+function under1000(n) {
+  if (n < 20) return ONES[n];
+  if (n < 100) return TENS[Math.floor(n / 10)] + (n % 10 ? " " + ONES[n % 10] : "");
+  return ONES[Math.floor(n / 100)] + " hundred" + (n % 100 ? " " + under1000(n % 100) : "");
+}
+
+function cardinal(n) {
+  if (n === 0) return "zero";
+  const parts = [];
+  for (const [value, name] of [[1e9, "billion"], [1e6, "million"], [1e3, "thousand"]]) {
+    if (n >= value) {
+      parts.push(under1000(Math.floor(n / value)) + " " + name);
+      n %= value;
+    }
+  }
+  if (n) parts.push(under1000(n));
+  return parts.join(" ");
+}
+
+// 2026 → "twenty twenty six", 2000 → "two thousand", 1900 → "nineteen hundred".
+function yearWords(n) {
+  if (n % 1000 === 0) return cardinal(n);
+  if (n >= 2000 && n < 2010) return cardinal(n);
+  if (n % 100 === 0) return under1000(Math.floor(n / 100)) + " hundred";
+  const lo = n % 100;
+  return under1000(Math.floor(n / 100)) + " "
+    + (lo < 10 ? "oh " + ONES[lo] : under1000(lo));
+}
+
+// A standalone figure, optionally money, decimal, or a percentage. The
+// lookaround keeps digits welded to letters out of it (GA4, 1st, 16GB) so only
+// free-standing numbers convert, and leaves any digit inside an already
+// spoken-out URL path alone.
+// The ",\d" and "\.\d" arms of the lookahead stop the number branches
+// backtracking into a longer figure whose tail is welded to letters. Without
+// them the optional groups are simply dropped and only the head converts:
+// "2,950kg" speaks as "two,950kg" and "2.5kg" as "two.5kg".
+const NUMBER_RE =
+  /(?<![A-Za-z0-9.,])(\$)?(\d{1,3}(?:,\d{3})+|\d+)(?:\.(\d+))?(%)?(?![A-Za-z0-9]|[.,]\d)/g;
+
+function speakNumbers(t) {
+  return t
+    // Digit ranges read as a span, not a pause: "7-14" → "7 to 14". Must run
+    // before the generic dash rule below turns it into a comma.
+    .replace(/(\d)\s*[-–—]\s*(\d)/g, "$1 to $2")
+    .replace(NUMBER_RE, (match, dollar, intPart, frac, pct) => {
+      const n = parseInt(intPart.replace(/,/g, ""), 10);
+      // cardinal() only names groups through billions; anything larger would
+      // spell "undefined hundred billion", so leave it for the engine.
+      if (!Number.isFinite(n) || n >= 1e12) return match;
+
+      // Money with cents is said as dollars-then-cents, never "point five zero
+      // dollars". A bare ".5" is 50 cents, ".05" is 5. More than two decimals
+      // is not a price, and silently truncating it would speak a wrong amount
+      // ("$1.999" as "one dollar ninety nine"), so leave it for the engine.
+      if (dollar && frac) {
+        if (frac.length > 2) return match;
+        const cents = parseInt(frac.padEnd(2, "0"), 10);
+        return cardinal(n) + (n === 1 ? " dollar" : " dollars")
+          + (cents ? " " + cardinal(cents) : "");
+      }
+
+      let words;
+      if (frac) words = cardinal(n) + " point " + frac.split("").map((d) => ONES[+d]).join(" ");
+      // Grouped thousands ("1,200 hours") are a quantity, never a year.
+      else if (!dollar && !pct && !intPart.includes(",")
+               && intPart.length === 4 && n >= 1900 && n <= 2099) words = yearWords(n);
+      else words = cardinal(n);
+      if (dollar) words += n === 1 ? " dollar" : " dollars";
+      if (pct) words += " percent";
+      return words;
+    });
+}
 
 /**
  * Defense in depth: the LLM prompt already forbids markdown, but strip any
  * residual markdown syntax and control characters before speaking them.
  */
 export function sanitizeText(raw) {
-  return raw
+  const spokenAddresses = raw
     .replace(/[*_#`~]/g, "")
     // Speech-normalize contacts: the persona writes them with real symbols
     // (me@alexrussell.io) so transcripts look right; audio needs the words —
@@ -40,10 +131,17 @@ export function sanitizeText(raw) {
         dom.replace(/\./g, " dot ").replace(/-/g, " dash "))
     .replace(/\b((?:[A-Za-z0-9-]+\.)+(?:io|com|nz|ai|dev|org|net|co))\b(\/[A-Za-z0-9\-/]*)?/g,
       (m, dom, path) => dom.replace(/\./g, " dot ").replace(/-/g, " dash ") +
-        (path ? " slash " + path.slice(1).replace(/\//g, " slash ").replace(/-/g, " dash ") : ""))
+        (path ? " slash " + path.slice(1).replace(/\//g, " slash ").replace(/-/g, " dash ") : ""));
+  return speakNumbers(spokenAddresses)
+    // Grades and languages are written as A+ and C++; say the symbol. The
+    // lookbehind accepts a preceding + so the second one in C++ also converts.
+    .replace(/(?<=[A-Za-z0-9+])\+/g, " plus ")
     .replace(/\s*[–—]+\s*/g, ", ") // persona forbids dashes; belt and braces
     .replace(/[\u0000-\u001f\u007f]/g, " ")
     .replace(/\s+/g, " ")
+    // Expanded symbols leave a space before whatever punctuation followed them
+    // ("A+," → "A plus ,"), which reads as an extra beat.
+    .replace(/ +([,.;:!?])/g, "$1")
     .trim();
 }
 
@@ -59,8 +157,17 @@ export default async function handler(req, res) {
     sendJson(res, 400, { error: "invalid_text" });
     return;
   }
+  // The 800-char contract is measured on the raw text the client sent; the
+  // sanitized form is checked separately and loosely, because spelling numbers
+  // out expands it (a "$9,500" of 6 chars speaks as 33) and a sentence that
+  // merely quotes a few prices must not fail the size check and go silent.
+  const rawLen = body.text.trim().length;
+  if (rawLen < 1 || rawLen > MAX_TEXT_CHARS) {
+    sendJson(res, 400, { error: "invalid_text" });
+    return;
+  }
   const text = sanitizeText(body.text);
-  if (text.length < 1 || text.length > MAX_TEXT_CHARS) {
+  if (text.length < 1 || text.length > MAX_SPOKEN_CHARS) {
     sendJson(res, 400, { error: "invalid_text" });
     return;
   }

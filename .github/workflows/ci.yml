@@ -22,6 +22,10 @@ jobs:
           node --check script.js
           for f in api/*.js; do node --check "$f"; done
 
+      # No browser needed, so it runs before the Chromium install.
+      - name: Speech normalizer suite
+        run: node test/verify-tts-text.js
+
       - name: Install test dependencies
         working-directory: test
         run: npm install

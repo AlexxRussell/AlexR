@@ -285,6 +285,61 @@ const check = (name, ok, extra) => {
       && links.prose.anchors[0].href === 'https://atvora.com/sample',
     JSON.stringify(links.prose));
 
+  // --- Sentence splitter: chunk boundaries must not fall inside a number ---
+  // The eager first flush cuts at the first comma, so a price written with a
+  // thousands separator once split into "$2," and "950" and reached the ear as
+  // "two dollars ... nine hundred fifty". sanitizeText is correct either way,
+  // so only a splitter-level check catches this.
+  // Deltas are fed one at a time, as the SSE stream really delivers them: a
+  // lookahead cannot see a digit that has not arrived yet, so a single
+  // whole-sentence call would pass while the streamed case still splits.
+  const split = await page.evaluate(() => {
+    const el = document.querySelector('alex-voice-widget');
+    const stream = (deltas) => {
+      const chunks = [];
+      el.queueSentence = (turn, t) => chunks.push(t);
+      const turn = { pending: '', flushed: false, sentences: [] };
+      for (const d of deltas) { turn.pending += d; el.splitPending(turn, false); }
+      el.splitPending(turn, true);
+      delete el.queueSentence;
+      return chunks;
+    };
+    return {
+      whole: stream(['The Sprint package starts at $2,950 and takes 5 working days.']),
+      commaEdge: stream(['The Sprint package starts at $2,', '950 and takes 5 working days.']),
+      twelfth: stream(['Alexander can deliver a focused Sprint integration for your team from $2',
+        ',950 and it ships fast.']),
+      digitEdge: stream(['That plan saves roughly 2', '5 hours a week for the whole team here.']),
+      // Alphanumeric knowledge-base terms are tokens too: cutting "CS50" into
+      // "CS" + "50" speaks as "C S" then "fifty". Needs 12 words before the
+      // term, or the eager flush never fires and the case proves nothing.
+      course: stream(['Alexander really finished the whole introductory computer science course known online as CS50',
+        "'s track."]),
+      clause: stream(['Alexander builds agentic systems, and he ships them fast in days.']),
+      big: stream(['That pipeline processed 1,', '250,000 records last year without a hitch.']),
+    };
+  });
+  // No chunk may end on a partial number or begin with the rest of one.
+  const intact = (chunks, full) => chunks.some((c) => c.includes(full))
+    && !chunks.some((c) => /[$\d][\d.,]*$/.test(c.trim()))
+    && !chunks.some((c) => /^[,.]?\d/.test(c.trim()));
+  check('price intact when delivered whole', intact(split.whole, '$2,950'),
+    JSON.stringify(split.whole));
+  check('price intact when a delta ends on its comma', intact(split.commaEdge, '$2,950'),
+    JSON.stringify(split.commaEdge));
+  check('price intact when it is the twelfth word', intact(split.twelfth, '$2,950'),
+    JSON.stringify(split.twelfth));
+  check('bare number intact when a delta splits its digits', intact(split.digitEdge, '25'),
+    JSON.stringify(split.digitEdge));
+  check('multi-group number intact across deltas', intact(split.big, '1,250,000'),
+    JSON.stringify(split.big));
+  check('alphanumeric term intact across deltas',
+    split.course.some((c) => c.includes("CS50's")) && !split.course.some((c) => /^\d/.test(c.trim())),
+    JSON.stringify(split.course));
+  // The latency feature itself must still work.
+  check('eager comma flush still fires on a real clause comma',
+    split.clause[0] === 'Alexander builds agentic systems,', JSON.stringify(split.clause));
+
   // --- Speech layer (api/tts.js sanitizeText): symbols become words ---
   const { sanitizeText } = await import('../api/tts.js');
   check('TTS speaks dots, slashes, and hyphens in addresses',
