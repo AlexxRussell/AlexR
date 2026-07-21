@@ -473,6 +473,62 @@ const check = (name, ok, extra) => {
   check('noise nudge appears after repeated drops (once)', nudge.shown && nudge.once,
     JSON.stringify(nudge));
 
+  // --- Barge-in silences the voice, not the text ---
+  // Field incident: a (false) barge-in aborted the chat stream mid-delta and
+  // the bubble stranded a half sentence ("He carries a"). An interrupt must
+  // stop the audio instantly but let the reply finish typing; the completed
+  // text (not the heard fragment) is what history carries forward.
+  const soft = await page.evaluate(async () => {
+    const el = document.querySelector('alex-voice-widget');
+    delete el.runChat;                          // restore the real streaming loop
+    let push, closeStream;
+    const body = new ReadableStream({
+      start(c) {
+        push = (s) => c.enqueue(new TextEncoder().encode(s));
+        closeStream = () => c.close();
+      },
+    });
+    const realFetch = window.fetch.bind(window);
+    window.fetch = (url, opts) => String(url).includes('/api/chat')
+      ? Promise.resolve(new Response(body, {
+          status: 200, headers: { 'Content-Type': 'text/event-stream' },
+        }))
+      : realFetch(url, opts);
+    el.commitUtterance('tell me about alexander', true);
+    const turn = el.turn;
+    push('data: {"d":"He is sharp. He carries a"}\n\n');
+    await new Promise((r) => setTimeout(r, 60));
+    const midText = turn.el ? turn.el.textContent : 'NO BUBBLE';
+    el.interrupt('speech');                     // barge-in mid-stream
+    const cutAtInterrupt = turn.el.classList.contains('cut');
+    const stateAfter = el.state;
+    push('data: {"d":" deep respect for plain language."}\n\n');
+    push('data: {"done":true}\n\n');
+    closeStream();
+    await new Promise((r) => setTimeout(r, 100));
+    window.fetch = realFetch;
+    el.runChat = () => {};                      // re-stub for any later scenario
+    const hist = el.history[el.history.length - 1];
+    return {
+      midText,
+      cutAtInterrupt,
+      stateAfter,
+      finalText: turn.el.textContent,
+      cutAfter: turn.el.classList.contains('cut'),
+      histRole: hist.role,
+      histContent: hist.content,
+    };
+  });
+  check('barge-in mid-stream: bubble finishes typing',
+    soft.midText === 'He is sharp. He carries a'
+      && soft.finalText === 'He is sharp. He carries a deep respect for plain language.',
+    JSON.stringify({ mid: soft.midText, final: soft.finalText }));
+  check('finished bubble is not marked cut', !soft.cutAfter, `cut=${soft.cutAfter}`);
+  check('interrupt still frees the mic immediately', soft.stateAfter === 'listening', soft.stateAfter);
+  check('history carries the completed reply',
+    soft.histRole === 'assistant' && soft.histContent.includes('plain language.'),
+    JSON.stringify({ role: soft.histRole, content: soft.histContent }));
+
   await browser.close();
   srv.close();
   console.log(fails ? `\n${fails} FAILURES` : '\nALL CHECKS PASSED');

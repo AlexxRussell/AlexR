@@ -22,8 +22,10 @@
  *     are discarded, superseding a pending turn takes real speech (word +
  *     confidence gates), and tapping the orb while listening force-sends
  *     the current interim.
- *   - The assistant message kept in history after a barge-in is truncated
- *     to the sentences that actually reached the speaker (frame-counted).
+ *   - A barge-in silences the voice only: the interrupted reply detaches
+ *     and keeps streaming its text into the transcript bubble (no TTS, no
+ *     state changes), so no half-typed sentence is ever stranded. History
+ *     carries the on-screen text, upgraded to the full reply on completion.
  *   - Sentence-pipelined TTS with an eager first flush, so first audio
  *     lands while the model is still generating.
  *   - No Web Speech support (Firefox) or mic denied → text mode: same
@@ -815,6 +817,7 @@ class AlexVoiceWidget extends HTMLElement {
 
         // Fetch controllers + TTS queue
         this.chatCtrl = null;
+        this.detachedCtrls = new Set();     // chat streams finishing text after a barge-in
         this.ttsCtrl = null;
         this.ttsQueue = [];
         this.ttsBusy = false;
@@ -1095,6 +1098,12 @@ class AlexVoiceWidget extends HTMLElement {
         this.callGen++;     // cancels any startCall still awaiting setup
         if (!this.callActive) return;
         if (this.turn) this.interrupt('end');
+        // Bubbles a barge-in left finishing their text must not stream past
+        // teardown either; their catch path marks them visibly incomplete.
+        for (const c of this.detachedCtrls) {
+            try { c.abort(); } catch (e) { /* ignore */ }
+        }
+        this.detachedCtrls.clear();
         this.callActive = false;
         this.callDeadline = 0;
         this.sendCallBeacon(reason || 'end');
@@ -2142,7 +2151,7 @@ class AlexVoiceWidget extends HTMLElement {
         this.turn = {
             id, reply: '', pending: '', sentences: [],
             chatDone: false, flushed: false, canned: false, el: null,
-            ttsFailed: false,
+            ttsFailed: false, detached: false, histEntry: null,
         };
         this.resetPlayback();
         this.setState('thinking');
@@ -2159,7 +2168,7 @@ class AlexVoiceWidget extends HTMLElement {
         this.turn = {
             id, reply: text, pending: '', sentences: [],
             chatDone: true, flushed: true, canned: true, el: null,
-            ttsFailed: false,
+            ttsFailed: false, detached: false, histEntry: null,
         };
         this.resetPlayback();
         this.queueSentence(this.turn, text);
@@ -2212,7 +2221,13 @@ class AlexVoiceWidget extends HTMLElement {
         try {
             for (;;) {
                 const { done, value } = await reader.read();
-                if (turn.id !== this.utteranceId) { try { ctrl.abort(); } catch (e) { /* ignore */ } return; }
+                // A detached turn (barge-in with text already on screen) keeps
+                // streaming so its bubble finishes typing; only an undetached
+                // stale turn abandons the stream.
+                if (turn.id !== this.utteranceId && !turn.detached) {
+                    try { ctrl.abort(); } catch (e) { /* ignore */ }
+                    return;
+                }
                 if (done) break;
                 buf += dec.decode(value, { stream: true });
                 let idx;
@@ -2229,6 +2244,10 @@ class AlexVoiceWidget extends HTMLElement {
                         } else if (ev.done) {
                             this.onChatDone(turn);
                         } else if (ev.error) {
+                            // A detached turn's failure must not touch the
+                            // current turn (turnError would kill it): the
+                            // bubble just stays visibly incomplete.
+                            if (turn.detached) { this.finishDetached(turn, false); return; }
                             if (!attempt && !turn.reply) { this.retryChat(turn); return; }
                             this.turnError('the agent glitched, try again.');
                             return;
@@ -2236,15 +2255,18 @@ class AlexVoiceWidget extends HTMLElement {
                     }
                 }
             }
-            if (turn.id === this.utteranceId && !turn.chatDone) this.onChatDone(turn);
+            if (!turn.chatDone && (turn.detached || turn.id === this.utteranceId)) this.onChatDone(turn);
         } catch (e) {
-            if (turn.id === this.utteranceId) {
+            if (turn.detached) {
+                this.finishDetached(turn, false);
+            } else if (turn.id === this.utteranceId) {
                 if (!attempt && !turn.reply) { this.retryChat(turn); return; }
                 this.turnError('connection dropped, try again.');
             }
         } finally {
             clearTimeout(watchdog);
             if (this.chatCtrl === ctrl) this.chatCtrl = null;
+            this.detachedCtrls.delete(ctrl);
         }
     }
 
@@ -2264,11 +2286,12 @@ class AlexVoiceWidget extends HTMLElement {
         if (!turn.el) turn.el = this.addMsg('agent', '');
         renderAgentRich(turn.el, turn.reply);
         this.scrollTranscript();
-        this.splitPending(turn, false);
+        if (!turn.detached) this.splitPending(turn, false);   // detached = text only, no TTS
     }
 
     onChatDone(turn) {
         turn.chatDone = true;
+        if (turn.detached) { this.finishDetached(turn, true); return; }
         this.splitPending(turn, true);
         this.maybeFinishTurn();
     }
@@ -2477,11 +2500,24 @@ class AlexVoiceWidget extends HTMLElement {
         dbg.interrupts++;
         this.utteranceId++;                 // everything in flight is now stale
         dbg.utteranceId = this.utteranceId;
-        try { if (this.chatCtrl) this.chatCtrl.abort(); } catch (e) { /* ignore */ }
+        // An interrupt silences the VOICE, not the text: a reply already on
+        // screen detaches and keeps streaming into its bubble (the read loop
+        // honors turn.detached), so the transcript never strands a half-typed
+        // sentence — a false barge-in in the field cut an answer at "He
+        // carries a". Ending the call is the exception (nothing may stream
+        // past teardown), and a turn with no visible text has nothing worth
+        // finishing.
+        if (reason !== 'end' && !turn.canned && !turn.chatDone
+            && turn.el && turn.reply.length > 0 && this.chatCtrl) {
+            turn.detached = true;
+            this.detachedCtrls.add(this.chatCtrl);
+            this.chatCtrl = null;
+        } else {
+            try { if (this.chatCtrl) this.chatCtrl.abort(); } catch (e) { /* ignore */ }
+        }
         try { if (this.ttsCtrl) this.ttsCtrl.abort(); } catch (e) { /* ignore */ }
         this.ttsQueue.length = 0;
         this.clearPendingPcm();
-        const played = this.framesPlayed;
         const clearEpoch = ++this.playbackEpoch;
 
         // Flush: quick gain ramp (no click), then clear the ring buffer.
@@ -2507,16 +2543,19 @@ class AlexVoiceWidget extends HTMLElement {
             }, 45);
         }
 
-        // History gets only the sentences the visitor actually heard.
+        // History carries what is on screen — the visitor can read past the
+        // point the audio stopped. A detached turn keeps the entry reference
+        // so finishDetached can upgrade it to the full reply; the dashed
+        // "cut" style now means the TEXT is incomplete, so a finished bubble
+        // (chatDone) or one still typing (detached) never wears it.
         if (!turn.canned) {
-            const heard = played > 0
-                ? turn.sentences.filter((s) => s.startFrame < played).map((s) => s.text).join(' ')
-                : '';
-            if (heard) {
-                this.history.push({ role: 'assistant', content: heard.slice(0, MSG_MAX) });
+            const shown = turn.reply.trim();
+            if (shown) {
+                turn.histEntry = { role: 'assistant', content: shown.slice(0, MSG_MAX) };
+                this.history.push(turn.histEntry);
                 this.trimHistory();
             }
-            if (turn.el) turn.el.classList.add('cut');
+            if (turn.el && !turn.chatDone && !turn.detached) turn.el.classList.add('cut');
         }
 
         this.turn = null;
@@ -2529,6 +2568,22 @@ class AlexVoiceWidget extends HTMLElement {
         this.updateBufferedDebug();
         this.bargeHits = 0;
         if (this.callActive) this.setState('listening');
+    }
+
+    // A detached turn's stream ended. ok = the reply completed on screen:
+    // the bubble sheds any doubt and history gets the full text (the entry
+    // object may have been trimmed out of the array — then this is a no-op).
+    // Not ok (network died, call ended): the text really is incomplete, so
+    // the bubble wears the dashed cut style and history keeps the partial.
+    finishDetached(turn, ok) {
+        if (!turn.detached) return;         // double event (done + stream end)
+        turn.detached = false;
+        if (ok) {
+            const full = turn.reply.trim();
+            if (full && turn.histEntry) turn.histEntry.content = full.slice(0, MSG_MAX);
+        } else if (turn.el) {
+            turn.el.classList.add('cut');
+        }
     }
 
     turnError(msg) {
