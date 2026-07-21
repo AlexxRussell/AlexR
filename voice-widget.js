@@ -45,6 +45,7 @@ const TTS_URL = '/api/tts';
 const TARGET_RATE = 24000;      // TTS PCM sample rate (server contract)
 const HISTORY_MAX = 14;         // messages kept client-side
 const MSG_MAX = 1200;           // chars per message (server contract)
+const HISTORY_TOTAL_MAX = 8000; // aggregate chars across messages (server contract)
 const TTS_MAX = 800;            // chars per TTS request (server contract)
 const GREETING = "Hey, I'm Alexander's AI. Ask me anything about his work.";
 // Spoken turns never show the raw STT words (mishears would read as
@@ -111,6 +112,7 @@ const DG_LISTEN_URL = 'wss://api.deepgram.com/v1/listen'
 const DG_RATE = 16000;          // linear16 rate sent to Deepgram
 const DG_BATCH_MS = 100;        // mic audio batched into ~100 ms frames
 const DG_KEEPALIVE_MS = 8000;   // silence gap before a KeepAlive keeps the WS warm
+const DG_START_TIMEOUT_MS = 8000; // token fetch + WS handshake deadline before Web Speech fallback
 
 // Android pins an output stream to the call- or media-volume channel at
 // CREATION time (chromium media/audio/android/audio_manager_android.cc), and
@@ -335,6 +337,58 @@ function hrefFor(token) {
     return null;
 }
 
+function hostOf(href) {
+    // The URL parser normalizes case, default ports, and userinfo; .hostname
+    // drops any :port, so "alexrussell.io:443" and "alexrussell.io" compare equal.
+    try { return new URL(href).hostname.replace(/^www\./i, '').toLowerCase() || null; }
+    catch (e) { return null; }
+}
+
+// Do a label's implied destination and the real href point to the same place?
+// Same mailbox for mailto, same host otherwise (an unparseable side never matches).
+function sameTarget(labelHref, href) {
+    const mail = (h) => /^mailto:/i.test(h);
+    if (mail(labelHref) || mail(href)) {
+        return labelHref.replace(/^mailto:/i, '').toLowerCase()
+            === href.replace(/^mailto:/i, '').toLowerCase();
+    }
+    const lh = hostOf(labelHref);
+    const th = hostOf(href);
+    return !!lh && !!th && lh === th;
+}
+
+// A label a human reads as a destination — a domain (name.tld[:port][/path])
+// or an email — rather than as prose. Built from the linkifier's own TLD set.
+const ADDRESS_LABEL_RE = new RegExp(
+    '(?:[A-Za-z0-9-]+\\.)+(?:' + URL_TLDS + ')(?:[:/?#]\\S*)?$'
+    + '|[A-Za-z0-9._%+-]+@(?:[A-Za-z0-9-]+\\.)+[A-Za-z]{2,}', 'i');
+
+// A markdown label that is itself an address must point where it claims:
+// "[alexrussell.io](https://phish.example)" shows a trusted-looking name over
+// an attacker-controlled target (the persona never writes this, but a
+// prompt-injected reply could). The label is canonicalized first — every
+// character that renders no visible glyph is stripped: C0/C1 controls (NUL,
+// backspace), Unicode format characters (zero-width, bidi controls AND the
+// U+2066–U+2069 isolates), and default-ignorable code points, plus surrounding
+// punctuation. So neither "alexrussell.io." nor a control-split label like
+// "alexrussell.<U+0008>io" slips past the classifier as prose. An
+// explicit-scheme label is compared through the URL parser, so a port or path
+// cannot hide the host ("https://alexrussell.io:443"). A bare address must
+// resolve to the same host or mailbox as its href; an address-shaped label that
+// cannot be parsed fails closed. Only genuine prose keeps its link.
+function labelMasksHref(label, href) {
+    const token = label
+        .replace(/[\p{Cc}\p{Cf}\p{Default_Ignorable_Code_Point}]/gu, '')
+        .trim()
+        .replace(/^[\s([{<"'“‘]+/, '')
+        .replace(/[\s)\]}>"'”’.,;:!?]+$/, '')
+        .trim();
+    if (/^(?:https?:\/\/|mailto:)/i.test(token)) return !sameTarget(token, href);
+    if (!ADDRESS_LABEL_RE.test(token)) return false;    // prose label: no destination implied
+    const labelHref = hrefFor(token);
+    if (!labelHref) return true;                        // address-shaped but unparseable -> fail closed
+    return !sameTarget(labelHref, href);
+}
 function renderAgentRich(el, raw) {
     const text = despokenUrls(raw);
     el.textContent = '';
@@ -360,7 +414,8 @@ function renderAgentRich(el, raw) {
                 label = part;
             }
         }
-        const href = hrefFor(part);
+        let href = hrefFor(part);
+        if (href && md && labelMasksHref(label, href)) href = null;
         if (href) el.appendChild(makeAnchor(href, label));
         else el.appendChild(document.createTextNode(md ? md[0] : part));
         if (tail) el.appendChild(document.createTextNode(tail));
@@ -1718,7 +1773,18 @@ class AlexVoiceWidget extends HTMLElement {
     async startStt() {
         const gen = ++this.sttGen;      // this attempt owns the engine now
         let ok = false;
-        try { ok = await this.startDeepgram(gen); } catch (e) { ok = false; }
+        // The whole Deepgram attempt is deadline-bounded: a captive portal or
+        // black-holed mobile link can leave the token fetch or WS handshake
+        // pending for the entire call while sttEngine='deepgram' suppresses
+        // the Web Speech fallback — no transcription, no error. On timeout
+        // the race resolves false; stopDeepgram below bumps sttGen, so the
+        // straggler attempt cancels itself at its next generation check.
+        try {
+            ok = await Promise.race([
+                this.startDeepgram(gen),
+                new Promise((resolve) => setTimeout(() => resolve(false), DG_START_TIMEOUT_MS)),
+            ]);
+        } catch (e) { ok = false; }
         if (gen !== this.sttGen) return; // an END/restart superseded us
         if (!this.callActive || !this.voiceMode) return;
         if (!ok) {
@@ -2056,17 +2122,36 @@ class AlexVoiceWidget extends HTMLElement {
     }
 
     async reconnectDeepgram(gen) {
+        // Same deadline as startup: a black-holed replacement handshake (token
+        // fetch or WS) must not hang with sttEngine='deepgram' suppressing Web
+        // Speech for the rest of the call. On timeout the race resolves false
+        // and dgFallback → stopDeepgram bumps sttGen, so the straggler cancels
+        // itself at its next generation check.
         let ok = false;
         try {
-            const token = await this.fetchSttToken();
-            if (gen === this.sttGen && token && this.callActive && this.sttEngine === 'deepgram') {
-                await this.openDgSocket(token, gen);
-                ok = true;
-            }
-        } catch (e) { /* fall back below */ }
+            ok = await Promise.race([
+                this.reconnectAttempt(gen),
+                new Promise((resolve) => setTimeout(() => resolve(false), DG_START_TIMEOUT_MS)),
+            ]);
+        } catch (e) { ok = false; }
         if (gen !== this.sttGen) return; // superseded: not ours to act on
         if (!this.callActive || !this.voiceMode || this.sttEngine !== 'deepgram') return;
         if (!ok) this.dgFallback();
+    }
+
+    // One reconnect handshake. Never throws (a rejection here would be an
+    // unhandled one when the timeout wins the race) — any failure is false.
+    async reconnectAttempt(gen) {
+        try {
+            const token = await this.fetchSttToken();
+            if (gen !== this.sttGen || !token || !this.callActive || this.sttEngine !== 'deepgram') {
+                return false;
+            }
+            await this.openDgSocket(token, gen);
+            return true;
+        } catch (e) {
+            return false;
+        }
     }
 
     dgFallback() {
@@ -2140,8 +2225,16 @@ class AlexVoiceWidget extends HTMLElement {
         if (this.history.length > HISTORY_MAX) {
             this.history.splice(0, this.history.length - HISTORY_MAX);
         }
+        let total = 0;
         for (const m of this.history) {
             if (m.content.length > MSG_MAX) m.content = m.content.slice(0, MSG_MAX);
+            total += m.content.length;
+        }
+        // The server also caps the AGGREGATE (validateMessages: 8000 chars);
+        // count and per-message trims alone can still sum past it (14 × 1200)
+        // and every request would 400 until entries aged out. Drop oldest.
+        while (this.history.length > 1 && total > HISTORY_TOTAL_MAX) {
+            total -= this.history.shift().content.length;
         }
     }
 
@@ -2242,7 +2335,7 @@ class AlexVoiceWidget extends HTMLElement {
                         if (typeof ev.d === 'string' && ev.d) {
                             this.onDelta(turn, ev.d);
                         } else if (ev.done) {
-                            this.onChatDone(turn);
+                            this.onChatDone(turn, !!ev.cut);
                         } else if (ev.error) {
                             // A detached turn's failure must not touch the
                             // current turn (turnError would kill it): the
@@ -2255,7 +2348,12 @@ class AlexVoiceWidget extends HTMLElement {
                     }
                 }
             }
-            if (!turn.chatDone && (turn.detached || turn.id === this.utteranceId)) this.onChatDone(turn);
+            // Reaching here without a terminal {done} event means the stream
+            // hit EOF mid-answer (connection dropped): the reply is truncated,
+            // so finish it as cut rather than as a clean answer.
+            if (!turn.chatDone && (turn.detached || turn.id === this.utteranceId)) {
+                this.onChatDone(turn, true);
+            }
         } catch (e) {
             if (turn.detached) {
                 this.finishDetached(turn, false);
@@ -2289,9 +2387,16 @@ class AlexVoiceWidget extends HTMLElement {
         if (!turn.detached) this.splitPending(turn, false);   // detached = text only, no TTS
     }
 
-    onChatDone(turn) {
+    // cut = the answer may be incomplete: the server flags a done that hit
+    // the token budget or ended without a finish_reason, and an EOF with no
+    // terminal event at all is the same story from the connection side. The
+    // text still stands, but it must LOOK incomplete or a truncated reply
+    // reads as a strangely short complete one. A detached turn routes its
+    // cut marking through finishDetached (which also syncs history).
+    onChatDone(turn, cut) {
         turn.chatDone = true;
-        if (turn.detached) { this.finishDetached(turn, true); return; }
+        if (turn.detached) { this.finishDetached(turn, !cut); return; }
+        if (cut && turn.el) turn.el.classList.add('cut');
         this.splitPending(turn, true);
         this.maybeFinishTurn();
     }
@@ -2342,11 +2447,26 @@ class AlexVoiceWidget extends HTMLElement {
     // ================= TTS PIPELINE =================
 
     queueSentence(turn, text) {
-        const clean = cleanForTTS(text).slice(0, TTS_MAX);
+        let clean = cleanForTTS(text);
         if (clean.length < 2) return;
         turn.flushed = true;
-        dbg.sentencesQueued++;
-        this.ttsQueue.push({ turn, text: clean });
+        // The TTS contract caps a request at TTS_MAX chars. A rare oversized
+        // sentence used to be silently truncated there — full in the bubble,
+        // missing its tail from the ear. Split at word boundaries instead.
+        while (clean.length > TTS_MAX) {
+            let cutAt = clean.lastIndexOf(' ', TTS_MAX);
+            if (cutAt < TTS_MAX / 2) cutAt = TTS_MAX;   // no usable space: hard cut
+            const head = clean.slice(0, cutAt).trim();
+            if (head.length >= 2) {
+                dbg.sentencesQueued++;
+                this.ttsQueue.push({ turn, text: head });
+            }
+            clean = clean.slice(cutAt).trim();
+        }
+        if (clean.length >= 2) {
+            dbg.sentencesQueued++;
+            this.ttsQueue.push({ turn, text: clean });
+        }
         this.pumpTTS();
     }
 
@@ -2478,10 +2598,14 @@ class AlexVoiceWidget extends HTMLElement {
             this.history.push({ role: 'assistant', content: t.reply.trim().slice(0, MSG_MAX) });
             this.trimHistory();
         }
-        // A reply that produced no audio at all (TTS died on every sentence)
-        // must not fail silently — the visitor was waiting to HEAR it.
-        if (t.ttsFailed && !t.canned && this.playerNode && this.framesScheduled === 0 && t.reply.trim()) {
-            this.sysMsg('voice output hiccuped; the reply above is text only.');
+        // TTS failure must not pass silently — the visitor was waiting to
+        // HEAR the reply. No audio at all and a truncated sentence mid-reply
+        // (the server now closes abnormally on a broken upstream stream)
+        // both earn a note; the full text is in the bubble either way.
+        if (t.ttsFailed && !t.canned && this.playerNode && t.reply.trim()) {
+            this.sysMsg(this.framesScheduled === 0
+                ? 'voice output hiccuped; the reply above is text only.'
+                : 'voice output hiccuped partway; the full reply is in the text above.');
         }
         // A turn that finished with no text at all (upstream stall or empty
         // stream) must not just melt back into LISTENING as if answered.
@@ -2517,10 +2641,35 @@ class AlexVoiceWidget extends HTMLElement {
         }
         try { if (this.ttsCtrl) this.ttsCtrl.abort(); } catch (e) { /* ignore */ }
         this.ttsQueue.length = 0;
+        this.flushPlayback();
+
+        // History carries what is on screen — the visitor can read past the
+        // point the audio stopped. A detached turn keeps the entry reference
+        // so finishDetached can upgrade it to the full reply; the dashed
+        // "cut" style now means the TEXT is incomplete, so a finished bubble
+        // (chatDone) or one still typing (detached) never wears it.
+        if (!turn.canned) {
+            const shown = turn.reply.trim();
+            if (shown) {
+                turn.histEntry = { role: 'assistant', content: shown.slice(0, MSG_MAX) };
+                this.history.push(turn.histEntry);
+                this.trimHistory();
+            }
+            if (turn.el && !turn.chatDone && !turn.detached) turn.el.classList.add('cut');
+        }
+
+        this.turn = null;
+        this.bargeHits = 0;
+        if (this.callActive) this.setState('listening');
+    }
+
+    // Silence everything buffered right now: quick gain ramp (no click),
+    // clear the worklet ring buffer, reset the per-turn frame accounting.
+    // Shared by interrupt() and turnError() — a failed turn must not keep
+    // speaking stale audio any more than an interrupted one.
+    flushPlayback() {
         this.clearPendingPcm();
         const clearEpoch = ++this.playbackEpoch;
-
-        // Flush: quick gain ramp (no click), then clear the ring buffer.
         if (this.ctx && this.gain && this.playerNode) {
             const g = this.gain.gain;
             const t0 = this.ctx.currentTime;
@@ -2542,23 +2691,6 @@ class AlexVoiceWidget extends HTMLElement {
                 } catch (e) { /* ignore */ }
             }, 45);
         }
-
-        // History carries what is on screen — the visitor can read past the
-        // point the audio stopped. A detached turn keeps the entry reference
-        // so finishDetached can upgrade it to the full reply; the dashed
-        // "cut" style now means the TEXT is incomplete, so a finished bubble
-        // (chatDone) or one still typing (detached) never wears it.
-        if (!turn.canned) {
-            const shown = turn.reply.trim();
-            if (shown) {
-                turn.histEntry = { role: 'assistant', content: shown.slice(0, MSG_MAX) };
-                this.history.push(turn.histEntry);
-                this.trimHistory();
-            }
-            if (turn.el && !turn.chatDone && !turn.detached) turn.el.classList.add('cut');
-        }
-
-        this.turn = null;
         this.playerPlaying = false;
         this.framesWritten = 0;
         this.framesPlayed = 0;
@@ -2566,35 +2698,49 @@ class AlexVoiceWidget extends HTMLElement {
         dbg.framesWritten = 0;
         dbg.framesPlayed = 0;
         this.updateBufferedDebug();
-        this.bargeHits = 0;
-        if (this.callActive) this.setState('listening');
     }
 
-    // A detached turn's stream ended. ok = the reply completed on screen:
-    // the bubble sheds any doubt and history gets the full text (the entry
-    // object may have been trimmed out of the array — then this is a no-op).
-    // Not ok (network died, call ended): the text really is incomplete, so
-    // the bubble wears the dashed cut style and history keeps the partial.
+    // A detached turn's stream ended. History always syncs to the final
+    // on-screen text — deltas that arrived after the detach belong there too
+    // (the entry may have been trimmed out of the array, then the sync is a
+    // no-op). ok = it terminated cleanly; not ok (network died, call ended,
+    // or an EOF with no terminal event) means the text really is incomplete,
+    // so the bubble wears the dashed cut style.
     finishDetached(turn, ok) {
         if (!turn.detached) return;         // double event (done + stream end)
         turn.detached = false;
-        if (ok) {
-            const full = turn.reply.trim();
-            if (full && turn.histEntry) turn.histEntry.content = full.slice(0, MSG_MAX);
-        } else if (turn.el) {
-            turn.el.classList.add('cut');
+        const full = turn.reply.trim();
+        if (full && turn.histEntry) {
+            turn.histEntry.content = full.slice(0, MSG_MAX);
+            this.trimHistory();     // the upgrade can push the aggregate over budget
         }
+        if (!ok && turn.el) turn.el.classList.add('cut');
     }
 
     turnError(msg) {
         dbg.errors++;
         try { if (this.ttsCtrl) this.ttsCtrl.abort(); } catch (e) { /* ignore */ }
         this.ttsQueue.length = 0;
-        this.clearPendingPcm();
-        if (this.turn) {
+        const turn = this.turn;
+        if (turn) {
             this.utteranceId++;
             dbg.utteranceId = this.utteranceId;
             this.turn = null;
+            // Same finalization as an interrupt: stale buffered audio must
+            // stop (it used to keep speaking under the error line), and a
+            // partial reply on screen is real — keep it, marked cut, and in
+            // history, instead of vanishing behind the sys message.
+            this.flushPlayback();
+            if (!turn.canned) {
+                const shown = turn.reply.trim();
+                if (shown) {
+                    this.history.push({ role: 'assistant', content: shown.slice(0, MSG_MAX) });
+                    this.trimHistory();
+                }
+                if (turn.el && !turn.chatDone) turn.el.classList.add('cut');
+            }
+        } else {
+            this.clearPendingPcm();
         }
         this.sysMsg(msg);
         this.setState(this.callActive ? 'listening' : 'idle');

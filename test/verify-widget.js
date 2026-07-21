@@ -523,11 +523,310 @@ const check = (name, ok, extra) => {
     soft.midText === 'He is sharp. He carries a'
       && soft.finalText === 'He is sharp. He carries a deep respect for plain language.',
     JSON.stringify({ mid: soft.midText, final: soft.finalText }));
-  check('finished bubble is not marked cut', !soft.cutAfter, `cut=${soft.cutAfter}`);
+  check('finished bubble is not marked cut (at interrupt or after)',
+    !soft.cutAfter && !soft.cutAtInterrupt,
+    `atInterrupt=${soft.cutAtInterrupt} after=${soft.cutAfter}`);
   check('interrupt still frees the mic immediately', soft.stateAfter === 'listening', soft.stateAfter);
   check('history carries the completed reply',
     soft.histRole === 'assistant' && soft.histContent.includes('plain language.'),
     JSON.stringify({ role: soft.histRole, content: soft.histContent }));
+
+  // --- Detached / error-path edge cases (streamed through the real runChat) ---
+  // Shared harness: each __newChat() arms one controllable SSE response for
+  // the next /api/chat fetch, so scenarios can interleave two live streams.
+  await page.evaluate(() => {
+    const el = document.querySelector('alex-voice-widget');
+    delete el.runChat;
+    const realFetch = window.fetch.bind(window);
+    window.__realFetch = realFetch;
+    window.__chatQueue = [];
+    window.fetch = (url, opts) => {
+      if (String(url).includes('/api/chat') && window.__chatQueue.length) {
+        const ctl = window.__chatQueue.shift();
+        const stream = new ReadableStream({ start(c) { ctl.attach(c); } });
+        return Promise.resolve(new Response(stream, {
+          status: 200, headers: { 'Content-Type': 'text/event-stream' },
+        }));
+      }
+      return realFetch(url, opts);
+    };
+    window.__newChat = () => {
+      const ctl = { queued: [], c: null };
+      ctl.attach = (c) => { ctl.c = c; for (const b of ctl.queued) c.enqueue(b); ctl.queued = []; };
+      ctl.push = (s) => {
+        const b = new TextEncoder().encode(s);
+        if (ctl.c) ctl.c.enqueue(b); else ctl.queued.push(b);
+      };
+      ctl.close = () => { try { ctl.c.close(); } catch (e) { /* done */ } };
+      ctl.fail = () => { try { ctl.c.error(new Error('net')); } catch (e) { /* done */ } };
+      window.__chatQueue.push(ctl);
+      return ctl;
+    };
+  });
+
+  // A detached stream that DIES must mark the bubble cut and keep the partial.
+  const detachedFail = await page.evaluate(async () => {
+    const el = document.querySelector('alex-voice-widget');
+    const s = window.__newChat();
+    el.commitUtterance('question for a doomed stream', true);
+    const turn = el.turn;
+    s.push('data: {"d":"Partial answer that will di"}\n\n');
+    await new Promise((r) => setTimeout(r, 60));
+    el.interrupt('speech');
+    s.fail();
+    await new Promise((r) => setTimeout(r, 80));
+    const hist = el.history[el.history.length - 1];
+    return {
+      cut: turn.el.classList.contains('cut'),
+      text: turn.el.textContent,
+      histContent: hist.role === 'assistant' ? hist.content : 'WRONG ROLE',
+    };
+  });
+  check('detached stream failure: bubble marked cut, partial kept',
+    detachedFail.cut && detachedFail.text === 'Partial answer that will di'
+      && detachedFail.histContent === 'Partial answer that will di',
+    JSON.stringify(detachedFail));
+
+  // Barge-in with an immediate new question: old bubble finishes typing while
+  // the new turn streams its own; history keeps conversational order.
+  const concurrent = await page.evaluate(async () => {
+    const el = document.querySelector('alex-voice-widget');
+    const s1 = window.__newChat();
+    el.commitUtterance('first question', true);
+    const turn1 = el.turn;
+    s1.push('data: {"d":"First answer part one."}\n\n');
+    await new Promise((r) => setTimeout(r, 60));
+    const s2 = window.__newChat();
+    el.commitUtterance('second question', true);   // interrupts + detaches turn1
+    const turn2 = el.turn;
+    s2.push('data: {"d":"Second answer."}\n\n');
+    s1.push('data: {"d":" And the rest of one."}\n\n');
+    s1.push('data: {"done":true}\n\n');
+    s1.close();
+    s2.push('data: {"done":true}\n\n');
+    s2.close();
+    await new Promise((r) => setTimeout(r, 150));
+    const roles = el.history.slice(-4).map((h) => h.role).join(',');
+    const a1 = el.history.find((h) => h.content.includes('First answer'));
+    return {
+      text1: turn1.el.textContent,
+      text2: turn2 && turn2.el ? turn2.el.textContent : 'NO TURN2 BUBBLE',
+      cut1: turn1.el.classList.contains('cut'),
+      roles,
+      a1: a1 ? a1.content : 'MISSING',
+    };
+  });
+  check('concurrent turns: detached bubble completes, new turn streams its own',
+    concurrent.text1 === 'First answer part one. And the rest of one.'
+      && concurrent.text2 === 'Second answer.' && !concurrent.cut1,
+    JSON.stringify(concurrent));
+  check('concurrent turns: history keeps conversational order',
+    concurrent.roles === 'user,assistant,user,assistant'
+      && concurrent.a1 === 'First answer part one. And the rest of one.',
+    JSON.stringify({ roles: concurrent.roles, a1: concurrent.a1 }));
+
+  // Server-flagged truncation ({done, cut:true}) renders as a cut bubble.
+  const cutFlag = await page.evaluate(async () => {
+    const el = document.querySelector('alex-voice-widget');
+    const s = window.__newChat();
+    el.commitUtterance('question hitting the token budget', true);
+    const turn = el.turn;
+    s.push('data: {"d":"Truncated by budget"}\n\n');
+    s.push('data: {"done":true,"cut":true}\n\n');
+    s.close();
+    await new Promise((r) => setTimeout(r, 120));
+    return { cut: turn.el.classList.contains('cut'), state: el.state };
+  });
+  check('server cut flag marks the bubble incomplete', cutFlag.cut && cutFlag.state === 'listening',
+    JSON.stringify(cutFlag));
+
+  // Stream ends with NO terminal event (connection dropped mid-answer): the
+  // reply is truncated, so the bubble must be marked cut, not shown complete.
+  const eofNoTerm = await page.evaluate(async () => {
+    const el = document.querySelector('alex-voice-widget');
+    const s = window.__newChat();
+    el.commitUtterance('question whose stream just stops', true);
+    const turn = el.turn;
+    s.push('data: {"d":"An answer with no terminator"}\n\n');
+    s.close();                                   // EOF, never a {done}
+    await new Promise((r) => setTimeout(r, 120));
+    const hist = el.history[el.history.length - 1];
+    return {
+      cut: turn.el.classList.contains('cut'),
+      histContent: hist.role === 'assistant' ? hist.content : 'WRONG ROLE',
+      state: el.state,
+    };
+  });
+  check('EOF without a terminal event marks the bubble cut',
+    eofNoTerm.cut && eofNoTerm.histContent === 'An answer with no terminator'
+      && eofNoTerm.state === 'listening',
+    JSON.stringify(eofNoTerm));
+
+  // turnError mid-stream keeps the partial (marked cut, in history) and
+  // resets playback instead of abandoning buffered audio.
+  const errPartial = await page.evaluate(async () => {
+    const el = document.querySelector('alex-voice-widget');
+    const s = window.__newChat();
+    el.commitUtterance('question that upstream drops', true);
+    const turn = el.turn;
+    s.push('data: {"d":"Half an answer that then br"}\n\n');
+    await new Promise((r) => setTimeout(r, 60));
+    s.push('data: {"error":"upstream_error"}\n\n');
+    await new Promise((r) => setTimeout(r, 80));
+    const hist = el.history[el.history.length - 1];
+    const sys = [...el.shadowRoot.querySelectorAll('.m.sys')].map((m) => m.textContent);
+    return {
+      cut: turn.el.classList.contains('cut'),
+      histContent: hist.role === 'assistant' ? hist.content : 'WRONG ROLE',
+      glitchLine: sys.some((t) => t.includes('glitched')),
+      state: el.state,
+      frames: el.framesScheduled,
+    };
+  });
+  check('turnError keeps the partial reply (cut + history) and resets playback',
+    errPartial.cut && errPartial.histContent === 'Half an answer that then br'
+      && errPartial.glitchLine && errPartial.state === 'listening' && errPartial.frames === 0,
+    JSON.stringify(errPartial));
+
+  // Restore the stubs for anything that runs after this section.
+  await page.evaluate(() => {
+    const el = document.querySelector('alex-voice-widget');
+    window.fetch = window.__realFetch;
+    el.runChat = () => {};
+  });
+
+  // History packing: the server's 8000-char aggregate must hold client-side.
+  const budget = await page.evaluate(() => {
+    const el = document.querySelector('alex-voice-widget');
+    const saved = el.history;
+    el.history = [];
+    for (let i = 0; i < 14; i++) {
+      el.history.push({ role: i % 2 ? 'assistant' : 'user', content: String(i).repeat(700) });
+    }
+    el.trimHistory();
+    const total = el.history.reduce((s, m) => s + m.content.length, 0);
+    const last = el.history[el.history.length - 1].content.slice(0, 2);
+    const count = el.history.length;
+    el.history = saved;
+    return { total, count, last };
+  });
+  check('trimHistory enforces the 8000-char aggregate, newest kept',
+    budget.total <= 8000 && budget.count < 14 && budget.last === '13',
+    JSON.stringify(budget));
+
+  // Oversized sentences split at word boundaries instead of losing the tail.
+  const bigSentence = await page.evaluate(() => {
+    const el = document.querySelector('alex-voice-widget');
+    const savedPump = el.pumpTTS;
+    el.pumpTTS = () => {};
+    const words = [];
+    for (let i = 0; i < 120; i++) words.push('understanding');   // ~1680 chars
+    const text = words.join(' ') + '.';
+    const turn = { flushed: false };
+    el.ttsQueue.length = 0;
+    el.queueSentence(turn, text);
+    const chunks = el.ttsQueue.map((j) => j.text);
+    el.ttsQueue.length = 0;
+    el.pumpTTS = savedPump;
+    const rejoined = chunks.join(' ');
+    return {
+      count: chunks.length,
+      allWithin: chunks.every((c) => c.length <= 800),
+      noSplitWords: chunks.every((c) => /^[a-z]/i.test(c) && /(understanding|understanding\.)$/.test(c)),
+      complete: rejoined === text,
+    };
+  });
+  check('oversized sentence splits at word boundaries, nothing lost',
+    bigSentence.count >= 3 && bigSentence.allWithin && bigSentence.noSplitWords && bigSentence.complete,
+    JSON.stringify(bigSentence));
+
+  // Address-shaped markdown labels must point where they claim.
+  const mask = await page.evaluate(() => {
+    const el = document.querySelector('alex-voice-widget');
+    const bubble = (text) => {
+      const m = el.addMsg('agent', text);
+      return [...m.querySelectorAll('a')].map((a) => a.getAttribute('href'));
+    };
+    return {
+      phish: bubble('Visit [alexrussell.io](https://phish.example) today.'),
+      sameHost: bubble('Visit [alexrussell.io](https://www.alexrussell.io/about) today.'),
+      mailPhish: bubble('Mail [me@alexrussell.io](mailto:evil@attacker.example) now.'),
+      prose: bubble('See [the sample](https://atvora.com/sample) here.'),
+      // Canonicalization bypass attempts: a trailing period and a zero-width
+      // space inside the label must not sneak the address past the check.
+      dotBypass: bubble('Visit [alexrussell.io.](https://phish.example) today.'),
+      zwBypass: bubble('Visit [alexrussell​.io](https://phish.example) today.'),
+      pathHost: bubble('Open [atvora.com/sample](https://phish.example/sample) now.'),
+      // Explicit-scheme label with a port, and a bidi-isolate (U+2066) inside
+      // the label — both previously rendered live links to phish.example.
+      portBypass: bubble('Open [https://alexrussell.io:443](https://phish.example) now.'),
+      isolateBypass: bubble('Open [alexrussell.io⁦](https://phish.example) now.'),
+      // A legitimate explicit-scheme same-host label must still link.
+      schemeSame: bubble('Open [https://alexrussell.io](https://alexrussell.io/contact) now.'),
+      // C0 controls (backspace, NUL) render invisibly but are neither format
+      // nor default-ignorable — they must be stripped before classification.
+      bsBypass: bubble('Visit [alexrussell.io](https://phish.example) today.'),
+      nulBypass: bubble('Visit [alexrussell. io](https://phish.example) today.'),
+    };
+  });
+  check('markdown label cannot mask a different host', mask.phish.length === 0,
+    JSON.stringify(mask.phish));
+  check('same-host markdown label still links',
+    mask.sameHost.length === 1 && mask.sameHost[0] === 'https://www.alexrussell.io/about',
+    JSON.stringify(mask.sameHost));
+  check('email label cannot mask a different mailbox', mask.mailPhish.length === 0,
+    JSON.stringify(mask.mailPhish));
+  check('prose markdown labels still link', mask.prose.length === 1,
+    JSON.stringify(mask.prose));
+  check('trailing-punctuation address label cannot mask host', mask.dotBypass.length === 0,
+    JSON.stringify(mask.dotBypass));
+  check('zero-width-split address label cannot mask host', mask.zwBypass.length === 0,
+    JSON.stringify(mask.zwBypass));
+  check('address label with a path cannot mask a different host', mask.pathHost.length === 0,
+    JSON.stringify(mask.pathHost));
+  check('explicit-scheme label with a port cannot mask a different host',
+    mask.portBypass.length === 0, JSON.stringify(mask.portBypass));
+  check('bidi-isolate in the label cannot mask a different host',
+    mask.isolateBypass.length === 0, JSON.stringify(mask.isolateBypass));
+  check('legit explicit-scheme same-host label still links',
+    mask.schemeSame.length === 1 && mask.schemeSame[0] === 'https://alexrussell.io/contact',
+    JSON.stringify(mask.schemeSame));
+  check('backspace-control in the label cannot mask a different host',
+    mask.bsBypass.length === 0, JSON.stringify(mask.bsBypass));
+  check('NUL-control in the label cannot mask a different host',
+    mask.nulBypass.length === 0, JSON.stringify(mask.nulBypass));
+
+  // --- Hero chat (script.js): the same {done,cut} stream marks truncation ---
+  const heroCut = await page.evaluate(async () => {
+    const realFetch = window.fetch.bind(window);
+    const stream = (frames) => new ReadableStream({
+      start(c) {
+        for (const f of frames) c.enqueue(new TextEncoder().encode(f));
+        c.close();
+      },
+    });
+    const run = async (frames) => {
+      window.fetch = () => Promise.resolve(new Response(stream(frames), {
+        status: 200, headers: { 'Content-Type': 'text/event-stream' },
+      }));
+      await window.askAlex('a hero-chat question');
+      const hist = document.getElementById('chat-history');
+      const last = hist.lastElementChild;
+      return last ? last.textContent : 'NONE';
+    };
+    const cut = await run(['data: {"d":"Truncated hero answer"}\n\n', 'data: {"done":true,"cut":true}\n\n']);
+    const clean = await run(['data: {"d":"Complete hero answer."}\n\n', 'data: {"done":true}\n\n']);
+    const dropped = await run(['data: {"d":"Answer with no terminator"}\n\n']);
+    window.fetch = realFetch;
+    return { cut, clean, dropped };
+  });
+  check('hero chat marks a server-cut answer', heroCut.cut.includes('[answer cut short]'),
+    heroCut.cut);
+  check('hero chat leaves a clean answer unmarked',
+    heroCut.clean.includes('Complete hero answer.') && !heroCut.clean.includes('cut short'),
+    heroCut.clean);
+  check('hero chat flags a dropped stream with no terminator',
+    heroCut.dropped.includes('[connection dropped, answer cut short]'), heroCut.dropped);
 
   await browser.close();
   srv.close();

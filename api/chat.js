@@ -244,11 +244,17 @@ export default async function handler(req, res) {
     if (!started) tail = tail.replace(/^\s+/, "");
     if (tail.length > 0) sseWrite(res, { d: tail });
     // A non-"stop" finish must never hide again: "length" means the visible
-    // answer was truncated by the token budget (the mid-sentence-cutoff bug).
-    if (finishReason && finishReason !== "stop") {
-      console.warn(`chat: finish_reason=${finishReason}`);
+    // answer was truncated by the token budget (the mid-sentence-cutoff bug),
+    // and an EOF with no finish_reason at all is an upstream that died early.
+    // Both used to collapse into a clean {done:true} and the client showed a
+    // fragment as a complete answer — done now carries cut:true so the
+    // transcript can mark it visibly incomplete.
+    const clean = finishReason === "stop";
+    if (!clean) {
+      if (finishReason) console.warn(`chat: finish_reason=${finishReason}`);
+      else console.error("chat: upstream ended without finish_reason");
     }
-    sseWrite(res, { done: true });
+    sseWrite(res, clean ? { done: true } : { done: true, cut: true });
     res.end();
   } catch (err) {
     if (controller.signal.aborted && !timedOut) {

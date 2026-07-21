@@ -216,6 +216,22 @@ const alexChat = {
     busy: false,
 };
 
+// Server contract (api/chat.js validateMessages): ≤16 messages, ≤1200 chars
+// each, ≤8000 chars total. Questions are capped at 500 on entry; replies are
+// capped at storage time; this packs the aggregate before every request —
+// one long conversation must never start 400ing until entries age out.
+const CHAT_MSG_MAX = 1200;
+const CHAT_TOTAL_MAX = 8000;
+
+function packChatHistory(list) {
+    const msgs = list.slice(-14);
+    let total = msgs.reduce((sum, m) => sum + m.content.length, 0);
+    while (msgs.length > 1 && total > CHAT_TOTAL_MAX) {
+        total -= msgs.shift().content.length;
+    }
+    return msgs;
+}
+
 function chatUiBusy(busy) {
     alexChat.busy = busy;
     document.querySelectorAll('#chat-chips button, #chat-send').forEach((b) => { b.disabled = busy; });
@@ -308,7 +324,7 @@ async function askAlex(question) {
         const res = await fetch('/api/chat', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ messages: alexChat.history.slice(-14) }),
+            body: JSON.stringify({ messages: packChatHistory(alexChat.history) }),
             signal: ctrl.signal,
         });
         if (!res.ok || !res.body) {
@@ -321,6 +337,8 @@ async function askAlex(question) {
         const reader = res.body.getReader();
         const dec = new TextDecoder();
         let buf = '';
+        let sawDone = false;
+        let cut = false;
         for (;;) {
             const { done, value } = await reader.read();
             if (done) break;
@@ -336,8 +354,12 @@ async function askAlex(question) {
                 if (ev.d) {
                     reply += ev.d;
                     typer.push(ev.d);
-                }
-                if (ev.error) {
+                } else if (ev.done) {
+                    // The server flags a done that may be truncated (token
+                    // budget hit, or upstream EOF with no finish_reason).
+                    sawDone = true;
+                    cut = !!ev.cut;
+                } else if (ev.error) {
                     if (ev.error === 'rate_limited') failText = 'rate limited, give it a beat and try again.';
                     throw new Error('upstream');
                 }
@@ -348,7 +370,15 @@ async function askAlex(question) {
         // Once complete, upgrade addresses/links in the answer to anchors
         // (renderer shared from the voice widget; plain text if absent).
         if (window.__alexvoiceRichText) window.__alexvoiceRichText(answerSpan, reply);
-        alexChat.history.push({ role: 'assistant', content: reply });
+        // A truncated answer, or a stream that ended with no terminal event at
+        // all (connection dropped), must not read as a complete one.
+        if (cut || !sawDone) {
+            const note = document.createElement('span');
+            note.className = 'text-gray-600';
+            note.textContent = cut ? ' [answer cut short]' : ' [connection dropped, answer cut short]';
+            aEl.appendChild(note);
+        }
+        alexChat.history.push({ role: 'assistant', content: reply.slice(0, CHAT_MSG_MAX) });
     } catch (err) {
         loaderEl.remove();
         if (!aEl.parentNode) historyEl.appendChild(aEl);
@@ -361,7 +391,7 @@ async function askAlex(question) {
             note.className = 'text-gray-600';
             note.textContent = ' [link dropped, answer cut short]';
             aEl.appendChild(note);
-            alexChat.history.push({ role: 'assistant', content: reply });
+            alexChat.history.push({ role: 'assistant', content: reply.slice(0, CHAT_MSG_MAX) });
         } else {
             if (typer) typer.cancel('');
             alexChat.history.pop(); // let the visitor retry cleanly

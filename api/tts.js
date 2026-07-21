@@ -6,7 +6,8 @@
 //     Content-Type:   application/octet-stream
 //     X-Audio-Format: pcm;rate=24000;bits=16;channels=1
 //   Errors before the first audio byte are JSON with a proper status code;
-//   after audio has started, the stream simply ends early.
+//   after audio has started, a failure closes the connection abnormally so
+//   the client can tell a broken clip from a complete one.
 //
 // Upstream: MiniMax T2A v2 (speech-2.8-turbo) SSE stream of hex audio chunks,
 // decoded to bytes here and forwarded as they arrive.
@@ -195,11 +196,16 @@ export default async function handler(req, res) {
 
   let audioStarted = false;
 
-  const failBeforeAudio = (status, message) => {
+  // Before the first audio byte a failure is a JSON error with a status.
+  // After it, the body is raw PCM with no framing left to carry an error —
+  // the only honest signal is an abnormal close, so the client's reader
+  // rejects and the widget marks the sentence failed. res.end() here used
+  // to make every mid-stream upstream failure look like a complete clip.
+  const failStream = (status, message) => {
     if (!audioStarted) {
       sendJson(res, status, { error: message });
     } else {
-      res.end();
+      try { res.destroy(); } catch { /* already closed */ }
     }
   };
 
@@ -240,12 +246,13 @@ export default async function handler(req, res) {
     if (!upstream.ok || !upstream.body) {
       console.error(`tts: upstream HTTP ${upstream.status} (${keyTag})`);
       if (!lastKey) return "retry";
-      failBeforeAudio(upstream.status === 429 ? 429 : 502, "upstream_error");
+      failStream(upstream.status === 429 ? 429 : 502, "upstream_error");
       return "done";
     }
 
     const decoder = new TextDecoder();
     let sseBuf = "";
+    let sawFinal = false;
 
     // Upstream SSE frames: data: {"data":{"audio":"<hex>","status":1},
     // "base_resp":{"status_code":0},...}; the final frame has status 2.
@@ -273,7 +280,7 @@ export default async function handler(req, res) {
             // Returning early cancels the upstream body stream.
             return "retry";
           }
-          failBeforeAudio(code === 1002 || code === 1039 ? 429 : 502, "upstream_error");
+          failStream(code === 1002 || code === 1039 ? 429 : 502, "upstream_error");
           return "done";
         }
 
@@ -295,8 +302,9 @@ export default async function handler(req, res) {
           }
           res.write(bytes);
         }
-        // event?.data?.status === 2 marks the final frame; the upstream
-        // stream closes right after, so the read loop ends naturally.
+        // status 2 marks the final frame; the upstream stream closes right
+        // after. Tracked so an EOF WITHOUT it is known to be a broken clip.
+        if (event?.data?.status === 2) sawFinal = true;
       }
     }
 
@@ -305,6 +313,12 @@ export default async function handler(req, res) {
       console.error(`tts: upstream stream ended with no audio (${keyTag})`);
       if (!lastKey) return "retry";
       sendJson(res, 502, { error: "upstream_error" });
+      return "done";
+    }
+    if (!sawFinal) {
+      // Audio flowed but the terminal frame never came: the clip is cut.
+      console.error(`tts: upstream ended without final frame (${keyTag})`);
+      try { res.destroy(); } catch { /* already closed */ }
       return "done";
     }
     res.end();
@@ -324,14 +338,16 @@ export default async function handler(req, res) {
           // Upstream stalled before producing any audio; the client is
           // still waiting and must see a failure, not an empty success.
           console.error(`tts: upstream timeout (${keyTag})`);
-          failBeforeAudio(504, "upstream_timeout");
+          failStream(504, "upstream_timeout");
           return;
         }
         if (controller.signal.aborted || audioStarted) {
-          // Client gone, or the stream broke mid-audio: nothing useful
-          // left to send.
+          // Client gone, or the stream broke mid-audio. Mid-audio breaks
+          // close abnormally so the widget's reader rejects and marks the
+          // sentence failed — a clean end() here read as a complete clip.
           try {
-            res.end();
+            if (audioStarted) res.destroy();
+            else res.end();
           } catch {
             /* already closed */
           }
@@ -339,7 +355,7 @@ export default async function handler(req, res) {
         }
         console.error(`tts: ${err?.name || "error"} (${keyTag})`);
         if (lastKey) {
-          failBeforeAudio(502, "upstream_error");
+          failStream(502, "upstream_error");
           return;
         }
         outcome = "retry"; // thrown before audio: the next key may still work
